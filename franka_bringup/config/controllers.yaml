@@ -78,6 +78,12 @@
       joint_velocity_example_controller:
         type: franka_example_controllers/JointVelocityExampleController
 
+      trajectory_following_joint_impedance_controller:
+        type: franka_example_controllers/TrajectoryFollowingJointImpedanceController
+
+      trajectory_subscriber_joint_impedance_controller:
+        type: franka_example_controllers/TrajectorySubscriberJointImpedanceController
+
       model_example_controller:
         type: franka_example_controllers/ModelExampleController
 
@@ -199,11 +205,83 @@
   joint_velocity_example_controller:
     ros__parameters:
       arm_id: "fr3"
- 
+
+/**:
+  trajectory_following_joint_impedance_controller:
+    ros__parameters:
+      gazebo: false
+      arm_id: "fr3"
+      trajectory_file: "/home/robot/franka_ros2_ws/src/franka_example_controllers/scripts/output.trajectory"
+      trajectory_rate: 10.0  # Hz
+      approach_duration: 4.0  # seconds to reach first waypoint (increased for slower approach)
+      k_gains:
+        - 200.0
+        - 200.0
+        - 200.0
+        - 200.0
+        - 100.0
+        - 100.0
+        - 100.0
+      d_gains:
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 5.0
+      # trajectory_file: ""  # Set this to the path of your trajectory file
+      # trajectory_rate: 30.0  # Hz
+      # approach_duration: 8.0  # seconds to reach first waypoint
+      # k_gains:
+      #   - 24.0
+      #   - 24.0
+      #   - 24.0
+      #   - 24.0
+      #   - 10.0
+      #   - 6.0
+      #   - 2.0
+      # d_gains:
+      #   - 2.0
+      #   - 2.0
+      #   - 2.0
+      #   - 1.0
+      #   - 1.0
+      #   - 1.0
+      #   - 0.5
+
+/**:
+  trajectory_subscriber_joint_impedance_controller:
+    ros__parameters:
+      gazebo: false
+      arm_id: "fr3"
+      trajectory_topic: "arm_joint_trajectory"
+      approach_duration: 4.0  # seconds to reach first waypoint
+      trajectory_timeout: 1.0  # seconds before considering trajectory stale
+      max_joint_distance: 0.1  # Maximum joint distance (rad) before using safe smooth approach
+      safe_approach_duration: 4.0  # Duration for smooth approach when distance threshold exceeded
+      k_gains:
+        - 200.0
+        - 200.0
+        - 200.0
+        - 200.0
+        - 100.0
+        - 100.0
+        - 100.0
+      d_gains:
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 5.0
+
 /**:
   model_example_controller:
     ros__parameters:
       arm_id: "fr3"
+
 
 /**:
   move_to_start_example_controller:

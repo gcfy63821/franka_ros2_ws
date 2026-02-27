@@ -27,6 +27,7 @@ find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_library(
@@ -42,6 +43,8 @@ add_library(
         src/joint_impedance_example_controller.cpp
         src/joint_impedance_with_ik_example_controller.cpp
         src/joint_position_example_controller.cpp
+        src/trajectory_following_joint_impedance_controller.cpp
+        src/trajectory_subscriber_joint_impedance_controller.cpp
         src/joint_velocity_example_controller.cpp
         src/model_example_controller.cpp
         src/motion_generator.cpp
@@ -65,6 +68,7 @@ ament_target_dependencies(
         rclcpp
         rclcpp_lifecycle
         std_srvs
+        trajectory_msgs
 )
 
 pluginlib_export_plugin_description_file(
@@ -81,6 +85,12 @@ install(
 install(
         DIRECTORY include/
         DESTINATION include
+)
+
+install(
+        PROGRAMS
+        scripts/convert_pkl_to_trajectory.py
+        DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)

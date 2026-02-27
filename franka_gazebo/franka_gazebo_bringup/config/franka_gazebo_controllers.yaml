@@ -11,8 +11,21 @@ controller_manager:
     joint_impedance_example_controller:
       type: franka_example_controllers/JointImpedanceExampleController
 
+    cartesian_pose_example_controller:
+      type: franka_example_controllers/CartesianPoseExampleController
+
+    trajectory_following_joint_impedance_controller:
+      type: franka_example_controllers/TrajectoryFollowingJointImpedanceController
+
+    trajectory_subscriber_joint_impedance_controller:
+      type: franka_example_controllers/TrajectorySubscriberJointImpedanceController
+
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
+
+cartesian_pose_example_controller:
+  ros__parameters:
+    gazebo: true
 
 joint_position_example_controller:
   ros__parameters:
@@ -40,3 +53,69 @@ joint_impedance_example_controller:
       - 1.0
       - 1.0
       - 0.5
+
+trajectory_following_joint_impedance_controller:
+  ros__parameters:
+    gazebo: true
+    trajectory_file: "/home/robot/franka_ros2_ws/src/franka_example_controllers/scripts/output.trajectory"
+    trajectory_rate: 10.0  # Hz
+    approach_duration: 4.0  # seconds to reach first waypoint (increased for slower approach)
+    k_gains:
+      - 200.0
+      - 200.0
+      - 200.0
+      - 200.0
+      - 100.0
+      - 100.0
+      - 100.0
+    d_gains:
+      - 10.0
+      - 10.0
+      - 10.0
+      - 10.0
+      - 10.0
+      - 10.0
+      - 5.0
+    # k_gains:
+    #   - 24.0
+    #   - 24.0
+    #   - 24.0
+    #   - 24.0
+    #   - 10.0
+    #   - 6.0
+    #   - 2.0
+    # d_gains:
+    #   - 2.0
+    #   - 2.0
+    #   - 2.0
+    #   - 1.0
+    #   - 1.0
+    #   - 1.0
+    #   - 0.5
+
+trajectory_subscriber_joint_impedance_controller:
+  ros__parameters:
+    gazebo: true
+    trajectory_topic: "arm_joint_trajectory"
+    approach_duration: 4.0  # seconds to reach first waypoint
+    trajectory_timeout: 1.0  # seconds before considering trajectory stale
+    max_joint_distance: 0.5  # Maximum joint distance (rad) before using safe smooth approach
+    safe_approach_duration: 4.0  # Duration for smooth approach when distance threshold exceeded
+    k_gains:
+      - 200.0
+      - 200.0
+      - 200.0
+      - 200.0
+      - 100.0
+      - 100.0
+      - 100.0
+    d_gains:
+      - 10.0
+      - 10.0
+      - 10.0
+      - 10.0
+      - 10.0
+      - 10.0
+      - 5.0
+
+  

@@ -11,6 +11,20 @@
             The joint impedance example controller moves joint 4 and 5 in a very compliant periodic movement.
         </description>
     </class>
+    <class name="franka_example_controllers/TrajectoryFollowingJointImpedanceController"
+           type="franka_example_controllers::TrajectoryFollowingJointImpedanceController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The trajectory following joint impedance controller loads a trajectory from a file
+            and follows it using joint impedance control with minimum jerk planning.
+        </description>
+    </class>
+    <class name="franka_example_controllers/TrajectorySubscriberJointImpedanceController"
+           type="franka_example_controllers::TrajectorySubscriberJointImpedanceController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The trajectory subscriber joint impedance controller subscribes to joint trajectory
+            messages and follows them using joint impedance control with minimum jerk planning.
+        </description>
+    </class>
     <class name="franka_example_controllers/JointVelocityExampleController"
            type="franka_example_controllers::JointVelocityExampleController" base_class_type="controller_interface::ControllerInterface">
         <description>

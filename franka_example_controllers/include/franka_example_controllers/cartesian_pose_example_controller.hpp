@@ -57,6 +57,7 @@ class CartesianPoseExampleController : public controller_interface::ControllerIn
   double robot_time_{0.0};
   std::string robot_description_;
   std::string arm_id_;
+  bool is_gazebo{false};
 };
 
 }  // namespace franka_example_controllers

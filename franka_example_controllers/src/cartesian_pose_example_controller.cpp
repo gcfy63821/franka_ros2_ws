@@ -82,6 +82,13 @@ controller_interface::return_type CartesianPoseExampleController::update(
 }
 
 CallbackReturn CartesianPoseExampleController::on_init() {
+  try {
+    auto_declare<bool>("gazebo", false);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
+    return CallbackReturn::ERROR;
+  }
+
   franka_cartesian_pose_ =
       std::make_unique<franka_semantic_components::FrankaCartesianPoseInterface>(
           franka_semantic_components::FrankaCartesianPoseInterface(k_elbow_activated_));
@@ -91,20 +98,7 @@ CallbackReturn CartesianPoseExampleController::on_init() {
 
 CallbackReturn CartesianPoseExampleController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  auto client = get_node()->create_client<franka_msgs::srv::SetFullCollisionBehavior>(
-      "service_server/set_full_collision_behavior");
-  auto request = DefaultRobotBehavior::getDefaultCollisionBehaviorRequest();
-
-  auto future_result = client->async_send_request(request);
-  future_result.wait_for(robot_utils::time_out);
-
-  auto success = future_result.get();
-  if (!success) {
-    RCLCPP_FATAL(get_node()->get_logger(), "Failed to set default collision behavior.");
-    return CallbackReturn::ERROR;
-  } else {
-    RCLCPP_INFO(get_node()->get_logger(), "Default collision behavior set.");
-  }
+  is_gazebo = get_node()->get_parameter("gazebo").as_bool();
 
   auto parameters_client =
       std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "robot_state_publisher");
@@ -119,6 +113,23 @@ CallbackReturn CartesianPoseExampleController::on_configure(
   }
 
   arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
+
+  if (!is_gazebo) {
+    auto client = get_node()->create_client<franka_msgs::srv::SetFullCollisionBehavior>(
+        "service_server/set_full_collision_behavior");
+    auto request = DefaultRobotBehavior::getDefaultCollisionBehaviorRequest();
+
+    auto future_result = client->async_send_request(request);
+    future_result.wait_for(robot_utils::time_out);
+
+    auto success = future_result.get();
+    if (!success) {
+      RCLCPP_FATAL(get_node()->get_logger(), "Failed to set default collision behavior.");
+      return CallbackReturn::ERROR;
+    } else {
+      RCLCPP_INFO(get_node()->get_logger(), "Default collision behavior set.");
+    }
+  }
 
   return CallbackReturn::SUCCESS;
 }
