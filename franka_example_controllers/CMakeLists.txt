@@ -45,6 +45,7 @@ add_library(
         src/joint_position_example_controller.cpp
         src/trajectory_following_joint_impedance_controller.cpp
         src/trajectory_subscriber_joint_impedance_controller.cpp
+        src/trajectory_waypoint_joint_impedance_controller.cpp
         src/joint_velocity_example_controller.cpp
         src/model_example_controller.cpp
         src/motion_generator.cpp
@@ -90,6 +91,7 @@ install(
 install(
         PROGRAMS
         scripts/convert_pkl_to_trajectory.py
+        scripts/hand_guided_recorder.py
         DESTINATION lib/${PROJECT_NAME}
 )
 

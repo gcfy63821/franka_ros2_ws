@@ -20,6 +20,9 @@ controller_manager:
     trajectory_subscriber_joint_impedance_controller:
       type: franka_example_controllers/TrajectorySubscriberJointImpedanceController
 
+    trajectory_waypoint_joint_impedance_controller:
+      type: franka_example_controllers/TrajectoryWaypointJointImpedanceController
+
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
@@ -117,5 +120,32 @@ trajectory_subscriber_joint_impedance_controller:
       - 10.0
       - 10.0
       - 5.0
+
+/**:
+  trajectory_waypoint_joint_impedance_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      gazebo: true
+      trajectory_topic: "/arm_joint_trajectory"
+      finish_topic: "/trajectory_finished"
+      start_topic: "/recording_start"
+      waypoint_duration: 4.0  # seconds to reach each waypoint
+      waypoint_tolerance: 0.05  # rad tolerance to consider waypoint reached
+      k_gains:
+        - 200.0
+        - 200.0
+        - 200.0
+        - 200.0
+        - 100.0
+        - 100.0
+        - 100.0
+      d_gains:
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 10.0
+        - 5.0
 
   

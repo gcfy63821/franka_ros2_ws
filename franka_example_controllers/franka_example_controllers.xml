@@ -25,6 +25,14 @@
             messages and follows them using joint impedance control with minimum jerk planning.
         </description>
     </class>
+    <class name="franka_example_controllers/TrajectoryWaypointJointImpedanceController"
+           type="franka_example_controllers::TrajectoryWaypointJointImpedanceController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The trajectory waypoint joint impedance controller receives a full joint trajectory
+            from a ROS topic, moves to each waypoint sequentially using minimum jerk trajectories,
+            and publishes a finish signal when the trajectory is complete.
+        </description>
+    </class>
     <class name="franka_example_controllers/JointVelocityExampleController"
            type="franka_example_controllers::JointVelocityExampleController" base_class_type="controller_interface::ControllerInterface">
         <description>
