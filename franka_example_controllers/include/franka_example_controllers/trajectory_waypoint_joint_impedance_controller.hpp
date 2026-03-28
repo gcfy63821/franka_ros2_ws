@@ -94,9 +94,14 @@ class TrajectoryWaypointJointImpedanceController : public controller_interface::
   double waypoint_start_time_{0.0};
   Vector7d waypoint_start_q_;  // Start position for current waypoint (captured when transitioning)
   double waypoint_duration_{5.0};  // seconds to reach each waypoint
-  double waypoint_tolerance_{0.05};  // rad tolerance to consider waypoint reached
+  double waypoint_tolerance_{0.01};  // rad tolerance to consider waypoint reached
   bool current_gripper_state_{false};  // Current gripper state (true = open, false = closed)
-  
+
+  // Gripper settle state
+  bool waiting_for_gripper_{false};
+  double gripper_action_time_{0.0};
+  double gripper_settle_time_{1.5};  // seconds to wait after gripper action
+
   // Gripper action clients
   std::shared_ptr<rclcpp_action::Client<franka_msgs::action::Grasp>> gripper_grasp_action_client_;
   std::shared_ptr<rclcpp_action::Client<franka_msgs::action::Move>> gripper_move_action_client_;

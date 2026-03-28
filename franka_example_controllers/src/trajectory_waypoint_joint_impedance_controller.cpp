@@ -173,6 +173,8 @@ void TrajectoryWaypointJointImpedanceController::trajectoryCallback(
   reached_current_waypoint_ = false;
   first_waypoint_reached_ = false;
   current_gripper_state_ = false;  // Reset gripper state
+  waiting_for_gripper_ = false;
+  gripper_action_time_ = 0.0;
   waypoint_start_time_ = 0.0;  // Will be set properly when controller activates
   // waypoint_start_q_ will be set when we start moving to first waypoint
   
@@ -227,60 +229,22 @@ TrajectoryWaypointJointImpedanceController::getCurrentWaypointTarget() {
   }
   
   // Initialize waypoint_start_time_ and waypoint_start_q_ if not already set
-  // This ensures we start timing and capture start position when we first try to move to a waypoint
   if (waypoint_start_time_ == 0.0 && !reached_current_waypoint_) {
     waypoint_start_time_ = elapsed_time_;
-    waypoint_start_q_ = q_;  // Capture current position as start for this waypoint
-    
-    // Get gripper state for current waypoint and control gripper if needed
-    bool target_gripper_state;
-    {
-      std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      if (current_idx < gripper_states_.size()) {
-        target_gripper_state = gripper_states_[current_idx];
-      } else {
-        target_gripper_state = false;  // Default to closed
-      }
-    }
-    
-    // Control gripper for current waypoint (especially important for first waypoint)
-    if (target_gripper_state != current_gripper_state_) {
-      RCLCPP_INFO(get_node()->get_logger(),
-                  "Starting waypoint %zu: Changing gripper state: %s -> %s",
-                  current_idx + 1,
-                  current_gripper_state_ ? "OPEN" : "CLOSED",
-                  target_gripper_state ? "OPEN" : "CLOSED");
-      controlGripper(target_gripper_state);
-      current_gripper_state_ = target_gripper_state;
-    } else {
-      RCLCPP_DEBUG(get_node()->get_logger(),
-                   "Starting waypoint %zu: Gripper state unchanged (%s)",
-                   current_idx + 1,
-                   current_gripper_state_ ? "OPEN" : "CLOSED");
-    }
-    
+    waypoint_start_q_ = q_;
+
     if (current_idx == 0) {
-      // For first waypoint, use initial position instead
       waypoint_start_q_ = initial_q_;
-      RCLCPP_INFO(get_node()->get_logger(),
-                  "Starting movement to first waypoint. Start: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f], "
-                  "Target: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f], Gripper: %s",
-                  waypoint_start_q_(0), waypoint_start_q_(1), waypoint_start_q_(2),
-                  waypoint_start_q_(3), waypoint_start_q_(4), waypoint_start_q_(5), waypoint_start_q_(6),
-                  target_waypoint(0), target_waypoint(1), target_waypoint(2),
-                  target_waypoint(3), target_waypoint(4), target_waypoint(5), target_waypoint(6),
-                  target_gripper_state ? "OPEN" : "CLOSED");
-    } else {
-      RCLCPP_INFO(get_node()->get_logger(),
-                  "Starting movement to waypoint %zu. Start: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f], "
-                  "Target: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f], Gripper: %s",
-                  current_idx + 1,
-                  waypoint_start_q_(0), waypoint_start_q_(1), waypoint_start_q_(2),
-                  waypoint_start_q_(3), waypoint_start_q_(4), waypoint_start_q_(5), waypoint_start_q_(6),
-                  target_waypoint(0), target_waypoint(1), target_waypoint(2),
-                  target_waypoint(3), target_waypoint(4), target_waypoint(5), target_waypoint(6),
-                  target_gripper_state ? "OPEN" : "CLOSED");
     }
+
+    RCLCPP_INFO(get_node()->get_logger(),
+                "Starting movement to waypoint %zu/%zu. Start: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f], "
+                "Target: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                current_idx + 1, num_waypoints,
+                waypoint_start_q_(0), waypoint_start_q_(1), waypoint_start_q_(2),
+                waypoint_start_q_(3), waypoint_start_q_(4), waypoint_start_q_(5), waypoint_start_q_(6),
+                target_waypoint(0), target_waypoint(1), target_waypoint(2),
+                target_waypoint(3), target_waypoint(4), target_waypoint(5), target_waypoint(6));
   }
   
   // Calculate distance to current waypoint (outside mutex)
@@ -288,91 +252,91 @@ TrajectoryWaypointJointImpedanceController::getCurrentWaypointTarget() {
   double max_error = error.cwiseAbs().maxCoeff();
   
   // Check if we've reached the current waypoint
-  // Similar to trajectory_following: check both time elapsed and error threshold
+  // Only consider reached when the position error is below tolerance (precise reaching)
   double t_elapsed_check = elapsed_time_ - waypoint_start_time_;
-  bool time_reached = (t_elapsed_check >= waypoint_duration_);
   bool error_reached = (max_error < waypoint_tolerance_);
-  
-  // If time has elapsed, we should have reached the target via minimum jerk
-  // If error is small enough, we've reached it via impedance control
-  // Use OR logic: reach if either condition is met
-  if (!reached_current_waypoint_ && (time_reached || error_reached)) {
+
+  if (!reached_current_waypoint_ && error_reached) {
     reached_current_waypoint_ = true;
     RCLCPP_INFO(get_node()->get_logger(),
-                "Reached waypoint %zu/%zu. Error: %.4f rad, Time: %.2f/%.2f s (time_reached=%d, error_reached=%d)",
-                current_idx + 1, num_waypoints, max_error, t_elapsed_check, waypoint_duration_,
-                time_reached, error_reached);
-    
+                "Reached waypoint %zu/%zu. Error: %.6f rad, Time: %.2f s",
+                current_idx + 1, num_waypoints, max_error, t_elapsed_check);
+
     // Send start signal when first waypoint is reached
-    // This signals the recorder to start continuous recording
     if (current_idx == 0 && !first_waypoint_reached_) {
       first_waypoint_reached_ = true;
       if (start_publisher_) {
         std_msgs::msg::Bool start_msg;
         start_msg.data = true;
         start_publisher_->publish(start_msg);
-        RCLCPP_INFO(get_node()->get_logger(), 
+        RCLCPP_INFO(get_node()->get_logger(),
                     "Published start signal to topic: %s (reached first waypoint)",
                     start_topic_.c_str());
       }
-      RCLCPP_INFO(get_node()->get_logger(), 
-                  "First waypoint reached, continuing to next waypoints...");
+    }
+
+    // After arriving, trigger gripper action if this waypoint requires a state change
+    bool target_gripper_state;
+    {
+      std::lock_guard<std::mutex> lock(trajectory_mutex_);
+      if (current_idx < gripper_states_.size()) {
+        target_gripper_state = gripper_states_[current_idx];
+      } else {
+        target_gripper_state = false;
+      }
+    }
+
+    if (target_gripper_state != current_gripper_state_) {
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "Waypoint %zu reached. Gripper: %s -> %s (settling %.1f s)",
+                  current_idx + 1,
+                  current_gripper_state_ ? "OPEN" : "CLOSED",
+                  target_gripper_state ? "OPEN" : "CLOSED",
+                  gripper_settle_time_);
+      controlGripper(target_gripper_state);
+      current_gripper_state_ = target_gripper_state;
+      waiting_for_gripper_ = true;
+      gripper_action_time_ = elapsed_time_;
     }
   }
-  
-  // If we've reached the current waypoint, prepare to move to next one
+
+  // If we've reached the current waypoint, check if gripper is done, then advance
   if (reached_current_waypoint_) {
+    // Wait for gripper to finish if an action was triggered
+    if (waiting_for_gripper_) {
+      double gripper_elapsed = elapsed_time_ - gripper_action_time_;
+      if (gripper_elapsed < gripper_settle_time_) {
+        // Hold position at current waypoint while gripper is settling
+        return target_waypoint;
+      }
+      // Gripper settle done
+      waiting_for_gripper_ = false;
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "Gripper settled after %.2f s. Proceeding from waypoint %zu.",
+                  gripper_elapsed, current_idx + 1);
+    }
+
     if (current_idx < num_waypoints - 1) {
-      // Move to next waypoint
+      // Advance to next waypoint
       {
         std::lock_guard<std::mutex> lock(trajectory_mutex_);
         current_waypoint_index_ = current_idx + 1;
+        target_waypoint = trajectory_[current_waypoint_index_];
       }
       reached_current_waypoint_ = false;
-      waypoint_start_time_ = elapsed_time_;  // Reset timer for new waypoint
-      waypoint_start_q_ = q_;  // Capture current position as start for next waypoint
-      
-      // Get next waypoint target and gripper state
-      bool target_gripper_state;
-      {
-        std::lock_guard<std::mutex> lock(trajectory_mutex_);
-        target_waypoint = trajectory_[current_waypoint_index_];
-        if (current_waypoint_index_ < gripper_states_.size()) {
-          target_gripper_state = gripper_states_[current_waypoint_index_];
-        } else {
-          target_gripper_state = false;  // Default to closed
-        }
-      }
-      
-      // Control gripper if state changed (do this before starting to move)
-      if (target_gripper_state != current_gripper_state_) {
-        RCLCPP_INFO(get_node()->get_logger(),
-                    "Changing gripper state: %s -> %s",
-                    current_gripper_state_ ? "OPEN" : "CLOSED",
-                    target_gripper_state ? "OPEN" : "CLOSED");
-        controlGripper(target_gripper_state);
-        current_gripper_state_ = target_gripper_state;
-      }
-      
+      waypoint_start_time_ = elapsed_time_;
+      waypoint_start_q_ = q_;
+
       RCLCPP_INFO(get_node()->get_logger(),
-                  "Starting movement to waypoint %zu/%zu. Start: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f], "
-                  "Target: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f] (gripper: %s)",
-                  current_waypoint_index_ + 1, num_waypoints,
-                  waypoint_start_q_(0), waypoint_start_q_(1), waypoint_start_q_(2),
-                  waypoint_start_q_(3), waypoint_start_q_(4), waypoint_start_q_(5), waypoint_start_q_(6),
-                  target_waypoint(0), target_waypoint(1), target_waypoint(2),
-                  target_waypoint(3), target_waypoint(4), target_waypoint(5), target_waypoint(6),
-                  target_gripper_state ? "OPEN" : "CLOSED");
-      
-      // Continue to use minimum jerk from captured start position to new target
-      // (will be handled in the code below)
+                  "Starting movement to waypoint %zu/%zu.",
+                  current_waypoint_index_ + 1, num_waypoints);
     } else {
-      // All waypoints reached
+      // All waypoints reached — handle gripper for last waypoint too
       {
         std::lock_guard<std::mutex> lock(trajectory_mutex_);
         trajectory_completed_ = true;
       }
-      RCLCPP_INFO(get_node()->get_logger(), 
+      RCLCPP_INFO(get_node()->get_logger(),
                   "Trajectory completed! Reached all %zu waypoints.",
                   num_waypoints);
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
@@ -467,7 +431,8 @@ CallbackReturn TrajectoryWaypointJointImpedanceController::on_init() {
     auto_declare<std::string>("finish_topic", "trajectory_finished");
     auto_declare<std::string>("start_topic", "recording_start");
     auto_declare<double>("waypoint_duration", 2.0);
-    auto_declare<double>("waypoint_tolerance", 0.05);
+    auto_declare<double>("waypoint_tolerance", 0.01);
+    auto_declare<double>("gripper_settle_time", 1.0);
     
     // Read arm_id early so it's available for command_interface_configuration()
     arm_id_ = get_node()->get_parameter("arm_id").as_string();
@@ -490,6 +455,7 @@ CallbackReturn TrajectoryWaypointJointImpedanceController::on_configure(
   start_topic_ = get_node()->get_parameter("start_topic").as_string();
   waypoint_duration_ = get_node()->get_parameter("waypoint_duration").as_double();
   waypoint_tolerance_ = get_node()->get_parameter("waypoint_tolerance").as_double();
+  gripper_settle_time_ = get_node()->get_parameter("gripper_settle_time").as_double();
   
   auto k_gains = get_node()->get_parameter("k_gains").as_double_array();
   auto d_gains = get_node()->get_parameter("d_gains").as_double_array();
@@ -653,8 +619,8 @@ CallbackReturn TrajectoryWaypointJointImpedanceController::on_configure(
   RCLCPP_INFO(get_node()->get_logger(), 
               "Trajectory subscription created. Waiting for trajectory messages...");
   RCLCPP_INFO(get_node()->get_logger(),
-              "Configuration: waypoint_duration=%.2f s, waypoint_tolerance=%.4f rad",
-              waypoint_duration_, waypoint_tolerance_);
+              "Configuration: waypoint_duration=%.2f s, waypoint_tolerance=%.4f rad, gripper_settle_time=%.2f s",
+              waypoint_duration_, waypoint_tolerance_, gripper_settle_time_);
   RCLCPP_INFO(get_node()->get_logger(),
               "Publishers created: finish='%s', start='%s'",
               resolved_finish_topic.c_str(), resolved_start_topic.c_str());
@@ -690,6 +656,8 @@ CallbackReturn TrajectoryWaypointJointImpedanceController::on_activate(
   reached_current_waypoint_ = false;
   first_waypoint_reached_ = false;
   current_gripper_state_ = false;  // Start with gripper closed
+  waiting_for_gripper_ = false;
+  gripper_action_time_ = 0.0;
   
   // If trajectory was already received before activation, prepare for execution
   {

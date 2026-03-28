@@ -93,6 +93,9 @@
       move_to_start_example_controller:
         type: franka_example_controllers/MoveToStartExampleController
 
+      teleop_joint_impedance_controller:
+        type: franka_example_controllers/TeleopJointImpedanceController
+
 /**:
   cartesian_elbow_example_controller:
     ros__parameters:
@@ -307,6 +310,32 @@
         - 5.0
 
 /**:
+  teleop_joint_impedance_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      joint_command_topic: "/teleop_joint_commands"
+      gripper_command_topic: "/teleop_gripper_command"
+      command_timeout: 0.5      # seconds before warning about stale commands
+      max_joint_distance: 0.5   # max rad jump allowed per command (safety)
+      gripper_threshold: 0.02   # below this width (m) = close gripper
+      k_gains:
+        - 200.0
+        - 200.0
+        - 200.0
+        - 200.0
+        - 100.0
+        - 100.0
+        - 50.0
+      d_gains:
+        - 20.0
+        - 20.0
+        - 20.0
+        - 20.0
+        - 10.0
+        - 10.0
+        - 5.0
+
+/**:
   trajectory_waypoint_joint_impedance_controller:
     ros__parameters:
       arm_id: "fr3"
@@ -315,7 +344,7 @@
       finish_topic: "/trajectory_finished"
       start_topic: "/recording_start"
       waypoint_duration: 4.0  # seconds to reach each waypoint
-      waypoint_tolerance: 0.05  # rad tolerance to consider waypoint reached
+      waypoint_tolerance: 0.01  # rad tolerance to consider waypoint reached
       k_gains:
         - 200.0
         - 200.0
