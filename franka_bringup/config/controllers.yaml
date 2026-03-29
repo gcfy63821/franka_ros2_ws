@@ -96,6 +96,9 @@
       teleop_joint_impedance_controller:
         type: franka_example_controllers/TeleopJointImpedanceController
 
+      dexhand_joint_impedance_controller:
+        type: franka_example_controllers/DexhandJointImpedanceController
+
 /**:
   cartesian_elbow_example_controller:
     ros__parameters:
@@ -358,6 +361,30 @@
         - 10.0
         - 10.0
         - 10.0
+        - 10.0
+        - 10.0
+        - 5.0
+
+/**:
+  dexhand_joint_impedance_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      joint_command_topic: "/teleop_joint_commands"
+      command_timeout: 0.5      # seconds before warning about stale commands
+      max_joint_distance: 0.5   # max rad jump allowed per command (safety)
+      k_gains:
+        - 200.0
+        - 200.0
+        - 200.0
+        - 200.0
+        - 100.0
+        - 100.0
+        - 50.0
+      d_gains:
+        - 20.0
+        - 20.0
+        - 20.0
+        - 20.0
         - 10.0
         - 10.0
         - 5.0

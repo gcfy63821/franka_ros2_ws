@@ -15,7 +15,7 @@ ROBOT1: # Arbitrary identifier for the first robot (a Mnemonic)
   joint_state_rate: 30 # Publishing rate for joint states (Hz)
   load_gripper: "true" # Enable Franka Gripper ("true" or "false")
   namespace: "" # No namespace — topics at root (e.g. /joint_states, /teleop_joint_commands)
-  robot_ip: "172.16.0.2" # Robot’s IP address or hostname
+  robot_ip: "172.16.0.3" # Robot’s IP address or hostname
   urdf_file: "fr3/fr3.urdf.xacro" # Relative path to URDF in franka_description/robots
   use_fake_hardware: "false" # Use simulated hardware ("true" or "false")
   use_rviz: "false" # Launch RViz if "true" (single instance for all namespaces)

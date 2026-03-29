@@ -51,7 +51,8 @@ add_library(
         src/model_example_controller.cpp
         src/motion_generator.cpp
         src/move_to_start_example_controller.cpp
-        src/teleop_joint_impedance_controller.cpp)
+        src/teleop_joint_impedance_controller.cpp
+        src/dexhand_joint_impedance_controller.cpp)
 target_include_directories(
         ${PROJECT_NAME}
         PUBLIC
