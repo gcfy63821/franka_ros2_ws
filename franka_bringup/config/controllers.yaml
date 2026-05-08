@@ -99,6 +99,9 @@
       dexhand_joint_impedance_controller:
         type: franka_example_controllers/DexhandJointImpedanceController
 
+      teach_replay_controller:
+        type: franka_example_controllers/TeachReplayController
+
 /**:
   cartesian_elbow_example_controller:
     ros__parameters:
@@ -372,6 +375,31 @@
       joint_command_topic: "/teleop_joint_commands"
       command_timeout: 0.5      # seconds before warning about stale commands
       max_joint_distance: 0.5   # max rad jump allowed per command (safety)
+      k_gains:
+        - 200.0
+        - 200.0
+        - 200.0
+        - 200.0
+        - 100.0
+        - 100.0
+        - 50.0
+      d_gains:
+        - 20.0
+        - 20.0
+        - 20.0
+        - 20.0
+        - 10.0
+        - 10.0
+        - 5.0
+
+/**:
+  teach_replay_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      mode_topic: "/teach_replay/mode"
+      trajectory_topic: "/teach_replay/trajectory"
+      start_topic: "/teach_replay/replay_started"
+      finish_topic: "/teach_replay/replay_finished"
       k_gains:
         - 200.0
         - 200.0

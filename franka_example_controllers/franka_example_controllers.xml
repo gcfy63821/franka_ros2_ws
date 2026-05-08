@@ -113,4 +113,13 @@
             Receives streaming joint position targets and tracks them using impedance control.
         </description>
     </class>
+    <class name="franka_example_controllers/TeachReplayController"
+           type="franka_example_controllers::TeachReplayController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Single controller with two modes for hand-guided teaching and dense trajectory replay.
+            TEACH mode sends zero torques (gravity compensation, robot is back-drivable).
+            REPLAY mode tracks a dense joint trajectory via joint impedance with linear interpolation
+            between adjacent points by time_from_start. Mode is switched via a topic.
+        </description>
+    </class>
 </library>

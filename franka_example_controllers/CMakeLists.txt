@@ -52,7 +52,8 @@ add_library(
         src/motion_generator.cpp
         src/move_to_start_example_controller.cpp
         src/teleop_joint_impedance_controller.cpp
-        src/dexhand_joint_impedance_controller.cpp)
+        src/dexhand_joint_impedance_controller.cpp
+        src/teach_replay_controller.cpp)
 target_include_directories(
         ${PROJECT_NAME}
         PUBLIC
@@ -96,6 +97,7 @@ install(
         PROGRAMS
         scripts/convert_pkl_to_trajectory.py
         scripts/hand_guided_recorder.py
+        scripts/teach_replay_orchestrator.py
         DESTINATION lib/${PROJECT_NAME}
 )
 
