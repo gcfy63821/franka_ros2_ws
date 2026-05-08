@@ -188,19 +188,22 @@ void TeachReplayController::trajectoryCallback(
   if (!any_velocity) {
     const size_t n = traj->times.size();
     for (size_t i = 0; i < n; ++i) {
+      double dt;
+      Vector7d dq;
       if (i == 0) {
-        double dt = traj->times[1] - traj->times[0];
-        traj->velocities[i] = dt > 1e-9 ? (traj->positions[1] - traj->positions[0]) / dt
-                                        : Vector7d::Zero();
+        dt = traj->times[1] - traj->times[0];
+        dq = traj->positions[1] - traj->positions[0];
       } else if (i + 1 == n) {
-        double dt = traj->times[i] - traj->times[i - 1];
-        traj->velocities[i] = dt > 1e-9 ? (traj->positions[i] - traj->positions[i - 1]) / dt
-                                        : Vector7d::Zero();
+        dt = traj->times[i] - traj->times[i - 1];
+        dq = traj->positions[i] - traj->positions[i - 1];
       } else {
-        double dt = traj->times[i + 1] - traj->times[i - 1];
-        traj->velocities[i] = dt > 1e-9
-                                  ? (traj->positions[i + 1] - traj->positions[i - 1]) / dt
-                                  : Vector7d::Zero();
+        dt = traj->times[i + 1] - traj->times[i - 1];
+        dq = traj->positions[i + 1] - traj->positions[i - 1];
+      }
+      if (dt > 1e-9) {
+        traj->velocities[i] = dq / dt;
+      } else {
+        traj->velocities[i].setZero();
       }
     }
   }
