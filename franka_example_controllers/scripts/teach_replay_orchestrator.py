@@ -33,7 +33,8 @@ Files (per session, under <output_dir>/session_YYYYMMDD_HHMMSS/):
 Usage:
     python3 teach_replay_orchestrator.py [--fps 30] [--record_rate 100]
         [--output_dir ~/robot_recordings]
-        [--image_topic /camera/color/image_raw]
+        [--image_topic /camera/camera/color/image_raw]
+        [--trajectory_smoothing_window 11]
         [--no_video]
 """
 
@@ -87,6 +88,7 @@ class TeachReplayOrchestrator(Node):
         super().__init__("teach_replay_orchestrator")
         self.fps = args.fps
         self.record_rate = args.record_rate
+        self.trajectory_smoothing_window = args.trajectory_smoothing_window
         self.output_dir = os.path.expanduser(args.output_dir)
         self.image_topic = args.image_topic
         self.record_video = (not args.no_video) and HAVE_CV
@@ -436,12 +438,40 @@ class TeachReplayOrchestrator(Node):
     # ------------------------------------------------------------------
     # Trajectory packaging
     # ------------------------------------------------------------------
+    def _smooth_joint_trajectory(self, qs):
+        window = int(self.trajectory_smoothing_window)
+        if window <= 1 or len(qs) < 3:
+            return qs
+        if window % 2 == 0:
+            window += 1
+        window = min(window, len(qs) if len(qs) % 2 == 1 else len(qs) - 1)
+        if window <= 1:
+            return qs
+
+        pad = window // 2
+        kernel = np.ones(window, dtype=float) / float(window)
+        padded = np.pad(qs, ((pad, pad), (0, 0)), mode="edge")
+        smoothed = np.empty_like(qs, dtype=float)
+        for joint_idx in range(qs.shape[1]):
+            smoothed[:, joint_idx] = np.convolve(
+                padded[:, joint_idx], kernel, mode="valid"
+            )
+
+        # Preserve exact endpoints so replay starts/finishes at the taught poses.
+        smoothed[0, :] = qs[0, :]
+        smoothed[-1, :] = qs[-1, :]
+        self.get_logger().info(
+            f"Applied joint trajectory smoothing window: {window} samples"
+        )
+        return smoothed
+
     def _build_trajectory_msg(self, times, qs):
         msg = JointTrajectory()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "base"
         msg.joint_names = list(ARM_JOINT_NAMES)
+        qs = self._smooth_joint_trajectory(np.asarray(qs, dtype=float))
         # Make sure the first sample sits at t=0 so the controller has a
         # well-defined reference at replay start.
         t0 = times[0]
@@ -648,11 +678,14 @@ def main():
                         help="Output video FPS (default: 30)")
     parser.add_argument("--record_rate", type=float, default=100.0,
                         help="Joint-state recording rate during teach/replay (Hz, default: 100)")
+    parser.add_argument("--trajectory_smoothing_window", type=int, default=11,
+                        help="Odd moving-average window for replay joint trajectory smoothing; "
+                             "set <=1 to disable (default: 11 samples)")
     parser.add_argument("--output_dir", type=str,
                         default="~/robot_recordings",
                         help="Output directory (default: ~/robot_recordings)")
     parser.add_argument("--image_topic", type=str,
-                        default="/camera/color/image_raw",
+                        default="/camera/camera/color/image_raw",
                         help="Image topic for video recording")
     parser.add_argument("--no_video", action="store_true",
                         help="Disable video recording (joint-only mode)")

@@ -302,8 +302,29 @@ controller_interface::return_type TeachReplayController::update(
       double t0 = traj.times[i];
       double t1 = traj.times[i + 1];
       double s = (replay_elapsed_ - t0) / std::max(1e-9, (t1 - t0));
-      q_d = traj.positions[i] + s * (traj.positions[i + 1] - traj.positions[i]);
-      dq_d = traj.velocities[i] + s * (traj.velocities[i + 1] - traj.velocities[i]);
+      s = std::clamp(s, 0.0, 1.0);
+
+      // Use cubic Hermite interpolation rather than piecewise-linear
+      // interpolation. The recorded teach trajectory is sampled at ~100 Hz;
+      // replay runs at 1 kHz, so C1-continuous interpolation prevents the
+      // reference velocity from jumping at every recorded sample.
+      const double h = std::max(1e-9, t1 - t0);
+      const double s2 = s * s;
+      const double s3 = s2 * s;
+      const double h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
+      const double h10 = s3 - 2.0 * s2 + s;
+      const double h01 = -2.0 * s3 + 3.0 * s2;
+      const double h11 = s3 - s2;
+
+      const double dh00 = (6.0 * s2 - 6.0 * s) / h;
+      const double dh10 = 3.0 * s2 - 4.0 * s + 1.0;
+      const double dh01 = (-6.0 * s2 + 6.0 * s) / h;
+      const double dh11 = 3.0 * s2 - 2.0 * s;
+
+      q_d = h00 * traj.positions[i] + h10 * h * traj.velocities[i] +
+            h01 * traj.positions[i + 1] + h11 * h * traj.velocities[i + 1];
+      dq_d = dh00 * traj.positions[i] + dh10 * traj.velocities[i] +
+             dh01 * traj.positions[i + 1] + dh11 * traj.velocities[i + 1];
     }
 
     // Joint-impedance torque with velocity feedforward.

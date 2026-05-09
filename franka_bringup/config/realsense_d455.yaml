@@ -1,0 +1,19 @@
+camera_name: camera
+camera_namespace: camera
+
+enable_color: true
+rgb_camera.color_profile: 640x480x30
+rgb_camera.color_format: RGB8
+rgb_camera.enable_auto_exposure: true
+
+enable_depth: false
+enable_infra: false
+enable_infra1: false
+enable_infra2: false
+enable_gyro: false
+enable_accel: false
+enable_motion: false
+
+align_depth.enable: false
+pointcloud.enable: false
+publish_tf: true

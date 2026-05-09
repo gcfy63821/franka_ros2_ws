@@ -38,7 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'robot_config_file',
             default_value=PathJoinSubstitution([
-                FindPackageShare('franka_bringup'), 'config', 'franka.config.yaml'
+                FindPackageShare('franka_bringup'), 'config', 'franka_arm.config.yaml'
             ]),
             description='Path to the robot configuration file to load',
         ),

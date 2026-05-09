@@ -44,7 +44,7 @@ class HandGuidedRecorder(Node):
         self.fps = fps
         self.output_dir = output_dir or os.path.expanduser("~/robot_recordings")
         os.makedirs(self.output_dir, exist_ok=True)
-        self.image_topic = image_topic or '/camera/color/image_raw'
+        self.image_topic = image_topic or '/camera/camera/color/image_raw'
         
         # Recording state
         self.recording_active = False
@@ -517,8 +517,8 @@ def main(args=None):
                        help='Recording frame rate (default: 30)')
     parser.add_argument('--output_dir', type=str, default=None,
                        help='Output directory for recordings (default: ~/robot_recordings)')
-    parser.add_argument('--image_topic', type=str, default='/camera/color/image_raw',
-                       help='ROS topic for camera images (default: /camera/color/image_raw)')
+    parser.add_argument('--image_topic', type=str, default='/camera/camera/color/image_raw',
+                       help='ROS topic for camera images (default: /camera/camera/color/image_raw)')
     
     args = parser.parse_args()
     
@@ -538,4 +538,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

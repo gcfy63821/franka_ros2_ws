@@ -49,10 +49,11 @@ ros2 launch franka_bringup teach_replay.launch.py
 ### 终端 2：相机（如需录像）
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py
+ros2 launch realsense2_camera rs_launch.py \
+  config_file:=/home/robot/franka_ros2_ws/install/franka_bringup/share/franka_bringup/config/realsense_d455.yaml
 ```
 
-默认图像 topic 为 `/camera/color/image_raw`。如果用其它相机，启动 orchestrator 时加 `--image_topic <topic>`。
+默认配置使用 D455 彩色流 `640x480x30`，图像 topic 为 `/camera/camera/color/image_raw`。如果用其它相机，启动 orchestrator 时加 `--image_topic <topic>`。
 
 ### 终端 3：键盘编排节点
 
@@ -61,8 +62,10 @@ ros2 run franka_example_controllers teach_replay_orchestrator.py
 # 可选参数:
 #   --fps 30                 输出视频帧率
 #   --record_rate 100        teach/replay 时关节角采样率（Hz）
+#   --trajectory_smoothing_window 11
+#                            replay 前对示教关节轨迹做移动平均平滑；<=1 关闭
 #   --output_dir ~/robot_recordings
-#   --image_topic /camera/color/image_raw
+#   --image_topic /camera/camera/color/image_raw
 #   --no_video               关掉视频录制（仅记关节）
 ```
 
