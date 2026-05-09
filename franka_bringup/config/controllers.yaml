@@ -403,8 +403,9 @@
       # When entering REPLAY, first run a min-jerk move from the current pose
       # to trajectory[0] before tracking. Set to false to skip and snap.
       move_to_start: true
-      move_to_start_min_duration: 2.0   # seconds, lower bound on pre-roll duration
-      move_to_start_max_velocity: 0.5   # rad/s, per-joint cap (sets duration when far)
+      move_to_start_min_duration: 4.0   # seconds, lower bound on pre-roll duration
+      move_to_start_max_velocity: 0.2   # rad/s, peak per-joint velocity cap
+                                        # (drives duration when far from start)
       k_gains:
         - 200.0
         - 200.0

@@ -87,8 +87,8 @@ class TeachReplayController : public controller_interface::ControllerInterface {
   // trajectory.points[0] before tracking the recorded trajectory, so the
   // robot does not snap if the user has dragged it away from the start.
   bool move_to_start_enabled_{true};
-  double move_to_start_min_duration_{2.0};   // seconds
-  double move_to_start_max_velocity_{0.5};   // rad/s, per-joint cap
+  double move_to_start_min_duration_{4.0};   // seconds
+  double move_to_start_max_velocity_{0.2};   // rad/s, peak per-joint cap
 
   // State
   Vector7d q_;

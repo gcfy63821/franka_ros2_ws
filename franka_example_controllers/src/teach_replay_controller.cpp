@@ -47,8 +47,8 @@ CallbackReturn TeachReplayController::on_init() {
     auto_declare<std::string>("start_topic", "/teach_replay/replay_started");
     auto_declare<std::string>("finish_topic", "/teach_replay/replay_finished");
     auto_declare<bool>("move_to_start", true);
-    auto_declare<double>("move_to_start_min_duration", 2.0);
-    auto_declare<double>("move_to_start_max_velocity", 0.5);
+    auto_declare<double>("move_to_start_min_duration", 4.0);
+    auto_declare<double>("move_to_start_max_velocity", 0.2);
   } catch (const std::exception& e) {
     fprintf(stderr, "TeachReplayController init failed: %s\n", e.what());
     return CallbackReturn::ERROR;
@@ -325,11 +325,18 @@ controller_interface::return_type TeachReplayController::update(
       pre_roll_elapsed_ = 0.0;
       const Vector7d delta = (traj.positions.front() - pre_roll_q_start_).cwiseAbs();
       const double max_delta = delta.maxCoeff();
-      pre_roll_duration_ =
-          std::max(move_to_start_min_duration_, max_delta / move_to_start_max_velocity_);
+      // For a quintic min-jerk profile q(u) = q0 + (10u^3-15u^4+6u^5)(qf-q0)
+      // the peak |dq/dt| is 15/8 * |qf - q0| / T = 1.875 * dq / T. To bound
+      // the peak per-joint velocity by move_to_start_max_velocity_, set
+      //     T >= 1.875 * max_delta / max_velocity
+      constexpr double kMinJerkPeakFactor = 1.875;
+      pre_roll_duration_ = std::max(
+          move_to_start_min_duration_,
+          kMinJerkPeakFactor * max_delta / move_to_start_max_velocity_);
       RCLCPP_INFO(get_node()->get_logger(),
-                  "Pre-roll: max joint delta %.3f rad, duration %.2f s",
-                  max_delta, pre_roll_duration_);
+                  "Pre-roll: max joint delta %.3f rad, duration %.2f s "
+                  "(peak velocity bound %.2f rad/s)",
+                  max_delta, pre_roll_duration_, move_to_start_max_velocity_);
     }
 
     pre_roll_elapsed_ += period.seconds();

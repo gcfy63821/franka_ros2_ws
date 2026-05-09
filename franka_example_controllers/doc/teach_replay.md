@@ -153,8 +153,8 @@ ros2 topic pub --once /teach_replay/mode std_msgs/msg/String "{data: replay}"
 k_gains: [200.0, 200.0, 200.0, 200.0, 100.0, 100.0, 50.0]
 d_gains: [ 20.0,  20.0,  20.0,  20.0,  10.0,  10.0,  5.0]
 move_to_start: true
-move_to_start_min_duration: 2.0   # 秒，pre-roll 时长下限
-move_to_start_max_velocity: 0.5   # rad/s，每关节速度上限
+move_to_start_min_duration: 4.0   # 秒，pre-roll 时长下限
+move_to_start_max_velocity: 0.2   # rad/s，峰值每关节速度上限
 ```
 
 - 重放跟踪不够紧 → 调高 `k_gains`（每个关节按 1.5–2× 递增试）
@@ -171,7 +171,7 @@ move_to_start_max_velocity: 0.5   # rad/s，每关节速度上限
 
 按 `r` 后控制器在内部走两个阶段：
 
-1. **PRE_ROLL**（move-to-start）：以当前位姿为起点，min-jerk 移动到 `traj[0]`。时长 = `max(move_to_start_min_duration, max_joint_dist / move_to_start_max_velocity)`，控制器日志会打印实际时长。**这一阶段不会发 `/teach_replay/replay_started`**，所以 orchestrator 不会录像。
+1. **PRE_ROLL**（move-to-start）：以当前位姿为起点，min-jerk 移动到 `traj[0]`。时长 = `max(min_duration, 1.875 × max_joint_dist / max_velocity)`（min-jerk 五次多项式的峰值速度系数是 15/8 = 1.875，所以 `max_velocity` 表示"峰值每关节角速度"）。控制器日志会打印实际时长。**这一阶段不会发 `/teach_replay/replay_started`**，所以 orchestrator 不会录像。
 2. **TRACKING**：发布 `/teach_replay/replay_started`，开始 cubic Hermite 跟随密集轨迹。结束时发 `/teach_replay/replay_finished` 并自动回 TEACH。
 
 任何阶段下，发 `mode: teach` 都会立即 abort 回零力矩。
