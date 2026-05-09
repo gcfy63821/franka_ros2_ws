@@ -54,7 +54,10 @@ class TeachReplayController : public controller_interface::ControllerInterface {
                                            const rclcpp::Duration& period) override;
 
  private:
-  enum class Mode : int { TEACH = 0, REPLAY = 1 };
+  // Phase is the controller's internal state machine. Externally users still
+  // toggle between "teach" and "replay" via the mode topic; the REPLAY
+  // command internally walks PRE_ROLL -> TRACKING.
+  enum class Phase : int { TEACH = 0, PRE_ROLL = 1, TRACKING = 2 };
 
   static constexpr int kNumJoints = 7;
 
@@ -79,6 +82,13 @@ class TeachReplayController : public controller_interface::ControllerInterface {
   std::string trajectory_topic_;
   std::string start_topic_;
   std::string finish_topic_;
+  // Pre-roll (move-to-start) configuration. When the user requests REPLAY,
+  // the controller first runs a min-jerk move from the current pose to
+  // trajectory.points[0] before tracking the recorded trajectory, so the
+  // robot does not snap if the user has dragged it away from the start.
+  bool move_to_start_enabled_{true};
+  double move_to_start_min_duration_{2.0};   // seconds
+  double move_to_start_max_velocity_{0.5};   // rad/s, per-joint cap
 
   // State
   Vector7d q_;
@@ -86,7 +96,7 @@ class TeachReplayController : public controller_interface::ControllerInterface {
   Vector7d dq_filtered_;
   Vector7d hold_q_;  // pose to hold after replay completes (last trajectory point)
 
-  std::atomic<int> mode_{static_cast<int>(Mode::TEACH)};
+  std::atomic<int> phase_{static_cast<int>(Phase::TEACH)};
   // Pending trajectory swap: callback fills next_trajectory_ + sets has_new_trajectory_,
   // realtime update() consumes it without blocking the callback.
   std::mutex trajectory_mutex_;
@@ -94,10 +104,14 @@ class TeachReplayController : public controller_interface::ControllerInterface {
   std::atomic<bool> has_new_trajectory_{false};
 
   std::shared_ptr<Trajectory> active_trajectory_;  // owned by update() thread
-  bool replay_running_{false};
   bool start_pending_{false};
   bool finish_pending_{false};
   double replay_elapsed_{0.0};
+
+  // Pre-roll state (only valid while phase_ == PRE_ROLL).
+  Vector7d pre_roll_q_start_;
+  double pre_roll_duration_{0.0};
+  double pre_roll_elapsed_{0.0};
 
   // Pub/sub
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_sub_;

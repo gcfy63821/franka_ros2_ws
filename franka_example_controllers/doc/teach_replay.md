@@ -147,24 +147,38 @@ ros2 topic pub --once /teach_replay/mode std_msgs/msg/String "{data: replay}"
 
 ## 8. 调参
 
-`franka_bringup/config/controllers.yaml` 里 `teach_replay_controller` 的 `k_gains` / `d_gains`：
+`franka_bringup/config/controllers.yaml` 里 `teach_replay_controller`：
 
 ```yaml
 k_gains: [200.0, 200.0, 200.0, 200.0, 100.0, 100.0, 50.0]
 d_gains: [ 20.0,  20.0,  20.0,  20.0,  10.0,  10.0,  5.0]
+move_to_start: true
+move_to_start_min_duration: 2.0   # 秒，pre-roll 时长下限
+move_to_start_max_velocity: 0.5   # rad/s，每关节速度上限
 ```
 
 - 重放跟踪不够紧 → 调高 `k_gains`（每个关节按 1.5–2× 递增试）
 - 重放有抖动或过冲 → 调高 `d_gains`，或降低 `k_gains`
 - TEACH 阶段感觉不够"软" → 与控制器无关，TEACH 始终发零力矩；阻力来自机器人内部摩擦
+- pre-roll 太快/猛 → 调小 `move_to_start_max_velocity` 或调大 `move_to_start_min_duration`
+- 想跳过 move-to-start（要求拖回起点后再按 `r`） → `move_to_start: false`
 
 修改后必须 `colcon build --packages-select franka_bringup` 并重启终端 1。
 
 ---
 
-## 9. 已知约束
+## 9. REPLAY 内部状态机
 
-- **REPLAY 起始位姿**：控制器在 REPLAY 时直接把第一点当参考，若当前位姿离 `traj[0]` 很远会有冲击。建议每次按 `r` 前手动把机械臂拖回示教起点附近，或后续在控制器里加一段从当前位姿到 `traj[0]` 的 min-jerk 过渡。
+按 `r` 后控制器在内部走两个阶段：
+
+1. **PRE_ROLL**（move-to-start）：以当前位姿为起点，min-jerk 移动到 `traj[0]`。时长 = `max(move_to_start_min_duration, max_joint_dist / move_to_start_max_velocity)`，控制器日志会打印实际时长。**这一阶段不会发 `/teach_replay/replay_started`**，所以 orchestrator 不会录像。
+2. **TRACKING**：发布 `/teach_replay/replay_started`，开始 cubic Hermite 跟随密集轨迹。结束时发 `/teach_replay/replay_finished` 并自动回 TEACH。
+
+任何阶段下，发 `mode: teach` 都会立即 abort 回零力矩。
+
+## 10. 已知约束
+
 - **夹爪 namespace**：当前假设 `franka.config.yaml` 中 `namespace: ""`。若改了 namespace，需要修改 orchestrator 中 `/franka_gripper/...` 路径。
 - **录像时机**：视频写入由 image 回调驱动（实际帧率 ≈ 相机帧率），但 `VideoWriter` 的 fps 头由 `--fps` 决定；如果两者差距大，回放视频会快/慢于现实。把 `--fps` 设成相机实际帧率即可。
 - **数据时间基准**：teach/replay 双方的 `relative_times` 都以 `time.time()` 为基准（wall clock），不是 ROS time。
+- **pre-roll 期间的夹爪状态**：示教记录里没有"起始夹爪状态"字段。如果示教第一个 gripper 事件不在 t=0，pre-roll 期间夹爪保持上一次操作的状态。如果需要严格匹配，按 `r` 前先手动把夹爪调到示教起始状态（或按 `h` homing）。

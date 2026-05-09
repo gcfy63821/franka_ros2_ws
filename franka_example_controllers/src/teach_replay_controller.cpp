@@ -46,6 +46,9 @@ CallbackReturn TeachReplayController::on_init() {
     auto_declare<std::string>("trajectory_topic", "/teach_replay/trajectory");
     auto_declare<std::string>("start_topic", "/teach_replay/replay_started");
     auto_declare<std::string>("finish_topic", "/teach_replay/replay_finished");
+    auto_declare<bool>("move_to_start", true);
+    auto_declare<double>("move_to_start_min_duration", 2.0);
+    auto_declare<double>("move_to_start_max_velocity", 0.5);
   } catch (const std::exception& e) {
     fprintf(stderr, "TeachReplayController init failed: %s\n", e.what());
     return CallbackReturn::ERROR;
@@ -59,6 +62,15 @@ CallbackReturn TeachReplayController::on_configure(const rclcpp_lifecycle::State
   trajectory_topic_ = get_node()->get_parameter("trajectory_topic").as_string();
   start_topic_ = get_node()->get_parameter("start_topic").as_string();
   finish_topic_ = get_node()->get_parameter("finish_topic").as_string();
+  move_to_start_enabled_ = get_node()->get_parameter("move_to_start").as_bool();
+  move_to_start_min_duration_ =
+      get_node()->get_parameter("move_to_start_min_duration").as_double();
+  move_to_start_max_velocity_ =
+      get_node()->get_parameter("move_to_start_max_velocity").as_double();
+  if (move_to_start_max_velocity_ <= 0.0) {
+    RCLCPP_FATAL(get_node()->get_logger(), "move_to_start_max_velocity must be > 0");
+    return CallbackReturn::FAILURE;
+  }
 
   auto k_gains = get_node()->get_parameter("k_gains").as_double_array();
   auto d_gains = get_node()->get_parameter("d_gains").as_double_array();
@@ -96,9 +108,10 @@ CallbackReturn TeachReplayController::on_activate(const rclcpp_lifecycle::State&
   updateJointStates();
   dq_filtered_.setZero();
   hold_q_ = q_;
-  mode_.store(static_cast<int>(Mode::TEACH));
-  replay_running_ = false;
+  phase_.store(static_cast<int>(Phase::TEACH));
   replay_elapsed_ = 0.0;
+  pre_roll_elapsed_ = 0.0;
+  pre_roll_duration_ = 0.0;
   active_trajectory_.reset();
   has_new_trajectory_.store(false);
   start_pub_->on_activate();
@@ -117,8 +130,8 @@ void TeachReplayController::modeCallback(const std_msgs::msg::String::SharedPtr 
   std::string m = msg->data;
   std::transform(m.begin(), m.end(), m.begin(), ::tolower);
   if (m == "teach" || m == "idle") {
-    mode_.store(static_cast<int>(Mode::TEACH));
-    RCLCPP_INFO(get_node()->get_logger(), "Mode -> TEACH (zero torque)");
+    phase_.store(static_cast<int>(Phase::TEACH));
+    RCLCPP_INFO(get_node()->get_logger(), "Phase -> TEACH (zero torque)");
   } else if (m == "replay") {
     if (!has_new_trajectory_.load() && !active_trajectory_) {
       RCLCPP_WARN(get_node()->get_logger(),
@@ -126,8 +139,17 @@ void TeachReplayController::modeCallback(const std_msgs::msg::String::SharedPtr 
                   trajectory_topic_.c_str());
       return;
     }
-    mode_.store(static_cast<int>(Mode::REPLAY));
-    RCLCPP_INFO(get_node()->get_logger(), "Mode -> REPLAY");
+    // Choose entry phase: if move_to_start is enabled, run a min-jerk move
+    // from the current pose to the trajectory's first point first, then
+    // start TRACKING. Otherwise jump straight to TRACKING.
+    if (move_to_start_enabled_) {
+      phase_.store(static_cast<int>(Phase::PRE_ROLL));
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "Phase -> PRE_ROLL (move-to-start before replay)");
+    } else {
+      phase_.store(static_cast<int>(Phase::TRACKING));
+      RCLCPP_INFO(get_node()->get_logger(), "Phase -> TRACKING (replay)");
+    }
   } else {
     RCLCPP_WARN(get_node()->get_logger(), "Unknown mode '%s' (expected teach|replay)",
                 msg->data.c_str());
@@ -242,6 +264,29 @@ void TeachReplayController::publishFinished() {
   finish_pub_->publish(msg);
 }
 
+// Quintic minimum-jerk interpolation along [0, T] from q0 to qf.
+// Returns position and velocity at time t (clamped to [0, T]).
+static void minJerk(const Eigen::Matrix<double, 7, 1>& q0,
+                    const Eigen::Matrix<double, 7, 1>& qf,
+                    double t, double T,
+                    Eigen::Matrix<double, 7, 1>& q_out,
+                    Eigen::Matrix<double, 7, 1>& dq_out) {
+  if (T <= 1e-9) {
+    q_out = qf;
+    dq_out.setZero();
+    return;
+  }
+  const double u = std::clamp(t / T, 0.0, 1.0);
+  const double u2 = u * u;
+  const double u3 = u2 * u;
+  const double u4 = u3 * u;
+  const double u5 = u4 * u;
+  const double s = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+  const double ds = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / T;
+  q_out = q0 + s * (qf - q0);
+  dq_out = ds * (qf - q0);
+}
+
 controller_interface::return_type TeachReplayController::update(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
   updateJointStates();
@@ -250,14 +295,15 @@ controller_interface::return_type TeachReplayController::update(
   constexpr double kAlpha = 0.99;
   dq_filtered_ = (1.0 - kAlpha) * dq_filtered_ + kAlpha * dq_;
 
-  // Pull pending trajectory in non-blocking fashion.
-  if (has_new_trajectory_.load()) {
+  // Pull pending trajectory only while we are not actively replaying. Swapping
+  // mid-replay would discard progress and confuse the orchestrator.
+  if (has_new_trajectory_.load() &&
+      static_cast<Phase>(phase_.load()) == Phase::TEACH) {
     std::unique_lock<std::mutex> lk(trajectory_mutex_, std::try_to_lock);
     if (lk.owns_lock() && next_trajectory_) {
       active_trajectory_ = next_trajectory_;
       next_trajectory_.reset();
       has_new_trajectory_.store(false);
-      replay_running_ = false;  // require explicit REPLAY mode to (re)start
       replay_elapsed_ = 0.0;
     }
   }
@@ -265,57 +311,82 @@ controller_interface::return_type TeachReplayController::update(
   Vector7d q_d = q_;
   Vector7d dq_d = Vector7d::Zero();
 
-  const auto current_mode = static_cast<Mode>(mode_.load());
+  const auto phase = static_cast<Phase>(phase_.load());
 
-  if (current_mode == Mode::REPLAY && active_trajectory_) {
-    if (!replay_running_) {
-      replay_running_ = true;
-      replay_elapsed_ = 0.0;
-      start_pending_ = true;
-      // Snap reference to current pose at start to avoid jolt; first segment will
-      // smoothly re-converge to traj[0] -> traj[1] interpolation.
+  // ------------------------------------------------------------------
+  // PRE_ROLL: min-jerk move from the pose at REPLAY entry to traj[0].
+  // ------------------------------------------------------------------
+  if (phase == Phase::PRE_ROLL && active_trajectory_) {
+    const auto& traj = *active_trajectory_;
+    if (pre_roll_duration_ <= 0.0) {
+      // First tick of pre-roll: snapshot start pose and size the duration
+      // from the per-joint distance so the move respects max_velocity.
+      pre_roll_q_start_ = q_;
+      pre_roll_elapsed_ = 0.0;
+      const Vector7d delta = (traj.positions.front() - pre_roll_q_start_).cwiseAbs();
+      const double max_delta = delta.maxCoeff();
+      pre_roll_duration_ =
+          std::max(move_to_start_min_duration_, max_delta / move_to_start_max_velocity_);
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "Pre-roll: max joint delta %.3f rad, duration %.2f s",
+                  max_delta, pre_roll_duration_);
     }
 
+    pre_roll_elapsed_ += period.seconds();
+    minJerk(pre_roll_q_start_, traj.positions.front(),
+            pre_roll_elapsed_, pre_roll_duration_, q_d, dq_d);
+
+    if (pre_roll_elapsed_ >= pre_roll_duration_) {
+      // Pre-roll done: enter TRACKING. The replay_started signal only fires
+      // here so external recorders begin capturing the actual replay, not
+      // the move-to-start motion.
+      phase_.store(static_cast<int>(Phase::TRACKING));
+      replay_elapsed_ = 0.0;
+      pre_roll_duration_ = 0.0;
+      pre_roll_elapsed_ = 0.0;
+      start_pending_ = true;
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "Pre-roll complete -> TRACKING (publishing replay_started)");
+    }
+
+    Vector7d tau =
+        k_gains_.cwiseProduct(q_d - q_) + d_gains_.cwiseProduct(dq_d - dq_filtered_);
+    for (int i = 0; i < kNumJoints; ++i) {
+      command_interfaces_[i].set_value(tau(i));
+    }
+  }
+  // ------------------------------------------------------------------
+  // TRACKING: follow the dense recorded trajectory.
+  // ------------------------------------------------------------------
+  else if (phase == Phase::TRACKING && active_trajectory_) {
     replay_elapsed_ += period.seconds();
     const auto& traj = *active_trajectory_;
     const double t_end = traj.times.back();
 
     if (replay_elapsed_ >= t_end) {
-      // Hold last point.
+      // Hold last point and finish.
       q_d = traj.positions.back();
       dq_d.setZero();
       hold_q_ = q_d;
-      if (replay_running_) {
-        replay_running_ = false;
-        finish_pending_ = true;
-        // Auto-revert to TEACH so the user can drag again without sending a mode msg.
-        mode_.store(static_cast<int>(Mode::TEACH));
-        RCLCPP_INFO(get_node()->get_logger(), "Replay finished; reverted to TEACH");
-      }
+      finish_pending_ = true;
+      phase_.store(static_cast<int>(Phase::TEACH));
+      RCLCPP_INFO(get_node()->get_logger(), "Replay finished; reverted to TEACH");
     } else {
-      // Find segment [i, i+1] with traj.times[i] <= t < traj.times[i+1].
-      // Linear scan is fine: trajectories are at most a few thousand points.
+      // Cubic Hermite interpolation between adjacent recorded samples.
       size_t i = 0;
       while (i + 1 < traj.times.size() && traj.times[i + 1] <= replay_elapsed_) {
         ++i;
       }
-      double t0 = traj.times[i];
-      double t1 = traj.times[i + 1];
-      double s = (replay_elapsed_ - t0) / std::max(1e-9, (t1 - t0));
-      s = std::clamp(s, 0.0, 1.0);
-
-      // Use cubic Hermite interpolation rather than piecewise-linear
-      // interpolation. The recorded teach trajectory is sampled at ~100 Hz;
-      // replay runs at 1 kHz, so C1-continuous interpolation prevents the
-      // reference velocity from jumping at every recorded sample.
+      const double t0 = traj.times[i];
+      const double t1 = traj.times[i + 1];
       const double h = std::max(1e-9, t1 - t0);
+      const double s = std::clamp((replay_elapsed_ - t0) / h, 0.0, 1.0);
       const double s2 = s * s;
       const double s3 = s2 * s;
       const double h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
       const double h10 = s3 - 2.0 * s2 + s;
       const double h01 = -2.0 * s3 + 3.0 * s2;
       const double h11 = s3 - s2;
-
       const double dh00 = (6.0 * s2 - 6.0 * s) / h;
       const double dh10 = 3.0 * s2 - 4.0 * s + 1.0;
       const double dh01 = (-6.0 * s2 + 6.0 * s) / h;
@@ -327,30 +398,27 @@ controller_interface::return_type TeachReplayController::update(
              dh01 * traj.positions[i + 1] + dh11 * traj.velocities[i + 1];
     }
 
-    // Joint-impedance torque with velocity feedforward.
     Vector7d tau =
         k_gains_.cwiseProduct(q_d - q_) + d_gains_.cwiseProduct(dq_d - dq_filtered_);
-    for (int i2 = 0; i2 < kNumJoints; ++i2) {
-      command_interfaces_[i2].set_value(tau(i2));
+    for (int i = 0; i < kNumJoints; ++i) {
+      command_interfaces_[i].set_value(tau(i));
     }
-  } else {
-    // TEACH (or REPLAY without a trajectory): zero torque, gravity compensation
-    // is handled internally by the Franka hardware.
+  }
+  // ------------------------------------------------------------------
+  // TEACH (and any abort path): zero torque, internal gravity compensation.
+  // ------------------------------------------------------------------
+  else {
     for (auto& cmd : command_interfaces_) {
       cmd.set_value(0.0);
     }
-    // Track current pose so a subsequent REPLAY hold reference is sensible.
     hold_q_ = q_;
-    if (replay_running_) {
-      // User flipped mode away mid-replay; cancel cleanly.
-      replay_running_ = false;
-      finish_pending_ = true;
-      RCLCPP_INFO(get_node()->get_logger(), "Replay aborted; back to TEACH");
-    }
+    // Reset pre-roll state so the next REPLAY recomputes duration.
+    pre_roll_duration_ = 0.0;
+    pre_roll_elapsed_ = 0.0;
+    replay_elapsed_ = 0.0;
   }
 
-  // Publish edge-triggered notifications outside the inner branches so they
-  // fire exactly once per transition regardless of which branch ran.
+  // Edge-triggered notifications outside the phase branches.
   if (start_pending_) {
     publishStarted();
     start_pending_ = false;

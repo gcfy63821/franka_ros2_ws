@@ -408,6 +408,10 @@ class TeachReplayOrchestrator(Node):
         # the mode switch flips it into REPLAY.
         threading.Timer(0.2, lambda: self._publish_mode("replay")).start()
         self.transition(self.STATE_REPLAYING)
+        self.get_logger().info(
+            "Waiting for controller pre-roll (move-to-start). Recording will "
+            "begin when /teach_replay/replay_started fires."
+        )
 
     def cmd_gripper(self, action):
         if action == "open":
