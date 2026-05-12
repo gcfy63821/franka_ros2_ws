@@ -452,3 +452,15 @@
       rotational_stiffness: 40.0        # Nm/rad
       nullspace_stiffness: 20.0         # Nm/rad on joint nullspace
       joint_damping_ratio: 1.0
+      # Fixed nullspace joint target — pulls the redundant DOF toward this
+      # posture throughout the run so the arm doesn't drift to weird configs
+      # while tracking the Cartesian trajectory. Default is the Franka ready
+      # pose. Leave empty ([]) to fall back to capturing q at activation.
+      nullspace_q_target:
+        - 0.0
+        - -0.7854   # -pi/4
+        - 0.0
+        - -2.3562   # -3*pi/4
+        - 0.0
+        - 1.5708    # pi/2
+        - 0.7854    # pi/4

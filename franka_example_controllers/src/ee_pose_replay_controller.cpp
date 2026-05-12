@@ -103,6 +103,10 @@ CallbackReturn EePoseReplayController::on_init() {
     auto_declare<double>("rotational_stiffness", 20.0);
     auto_declare<double>("nullspace_stiffness", 10.0);
     auto_declare<double>("joint_damping_ratio", 1.0);
+    // Nullspace joint target. If left empty, falls back to capturing the
+    // joint pose at the first update tick (legacy behavior). Otherwise
+    // must be 7 doubles in joint1..joint7 order.
+    auto_declare<std::vector<double>>("nullspace_q_target", {});
   } catch (const std::exception& e) {
     fprintf(stderr, "EePoseReplayController init failed: %s\n", e.what());
     return CallbackReturn::ERROR;
@@ -201,6 +205,28 @@ CallbackReturn EePoseReplayController::on_configure(
   rotational_stiffness_ = get_node()->get_parameter("rotational_stiffness").as_double();
   nullspace_stiffness_ = get_node()->get_parameter("nullspace_stiffness").as_double();
   joint_damping_ratio_ = get_node()->get_parameter("joint_damping_ratio").as_double();
+
+  auto q_target_vec = get_node()->get_parameter("nullspace_q_target").as_double_array();
+  if (q_target_vec.empty()) {
+    nullspace_q_target_fixed_ = false;
+    RCLCPP_INFO(get_node()->get_logger(),
+                "nullspace_q_target unset; will capture q at the first update tick.");
+  } else if (q_target_vec.size() != static_cast<size_t>(kNumJoints)) {
+    RCLCPP_FATAL(get_node()->get_logger(),
+                 "nullspace_q_target must have exactly %d entries, got %zu",
+                 kNumJoints, q_target_vec.size());
+    return CallbackReturn::FAILURE;
+  } else {
+    for (int i = 0; i < kNumJoints; ++i) {
+      nullspace_q_target_(i) = q_target_vec[i];
+    }
+    nullspace_q_target_fixed_ = true;
+    RCLCPP_INFO(get_node()->get_logger(),
+                "nullspace_q_target fixed at [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+                nullspace_q_target_(0), nullspace_q_target_(1), nullspace_q_target_(2),
+                nullspace_q_target_(3), nullspace_q_target_(4), nullspace_q_target_(5),
+                nullspace_q_target_(6));
+  }
 
   if (move_to_start_max_translation_velocity_ <= 0.0 ||
       move_to_start_max_rotation_velocity_ <= 0.0) {
@@ -609,7 +635,9 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
     hold_position_ = current_position_;
     hold_orientation_ = current_orientation_;
     hold_initialized_ = true;
-    nullspace_q_target_ = q_;
+    if (!nullspace_q_target_fixed_) {
+      nullspace_q_target_ = q_;
+    }
     RCLCPP_INFO(
         get_node()->get_logger(),
         "HOLD initialized: pos=(%.4f,%.4f,%.4f) q=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]",
@@ -678,12 +706,18 @@ controller_interface::return_type EePoseReplayController::update(
     last_command_position_ = current_position_;
     last_command_orientation_ = current_orientation_;
     last_command_initialized_ = true;
-    nullspace_q_target_ = q_;
+    if (!nullspace_q_target_fixed_) {
+      nullspace_q_target_ = q_;
+    }
     needs_initialization_ = false;
     RCLCPP_INFO(get_node()->get_logger(),
-                "Init complete: HOLD pos=(%.4f,%.4f,%.4f) q=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]",
+                "Init complete: HOLD pos=(%.4f,%.4f,%.4f) q=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] "
+                "null_q_target=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]",
                 hold_position_.x(), hold_position_.y(), hold_position_.z(),
-                q_(0), q_(1), q_(2), q_(3), q_(4), q_(5), q_(6));
+                q_(0), q_(1), q_(2), q_(3), q_(4), q_(5), q_(6),
+                nullspace_q_target_(0), nullspace_q_target_(1), nullspace_q_target_(2),
+                nullspace_q_target_(3), nullspace_q_target_(4), nullspace_q_target_(5),
+                nullspace_q_target_(6));
   }
 
   if (!computeDesiredPose(period)) {

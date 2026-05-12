@@ -115,6 +115,9 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   Eigen::Matrix<double, 6, 6> cartesian_stiffness_;
   Eigen::Matrix<double, 6, 6> cartesian_damping_;
   Vector7d nullspace_q_target_;
+  // True if nullspace_q_target_ came from yaml (constant). False = legacy
+  // behavior: capture q at first update tick / on HOLD entry.
+  bool nullspace_q_target_fixed_{false};
 
   // EE pose reader (state interface only).
   std::unique_ptr<franka_semantic_components::FrankaCartesianPoseInterface>
