@@ -1,8 +1,8 @@
 # EE Pose Control Replay 使用文档
 
 使用 `EePoseReplayController` + `ee_control_replay.py`，读取每个
-`traj_*/replay/EE_pose_FK.npz` 中的末端位姿，用 Franka Cartesian pose command
-interface 重放，并把新的状态记录到 `traj_*/FK_state/`。
+`traj_*/replay/EE_pose_FK.npz` 中的末端位姿，由控制器解 IK 后通过 joint
+control 重放，并把新的状态记录到 `traj_*/FK_state/`。
 
 每条轨迹开始前，控制器会先用 min-jerk 轨迹从当前 TCP 位姿平稳过渡到
 FK 文件第一帧，然后才发布 `replay_started` 并开始记录。
@@ -46,7 +46,9 @@ ros2 run franka_example_controllers ee_control_replay.py \
 ```
 
 非 test 模式会自动按 `traj_0, traj_1, ...` 顺序重放所有包含
-`replay/EE_pose_FK.npz` 的轨迹。
+`replay/EE_pose_FK.npz` 的轨迹。读取数据目录后，命令行会提示
+`starting from traj num?`；输入起始编号后，脚本只 replay 该编号及之后的
+轨迹。比如输入 `12`，会从 `traj_12` 或下一个存在的更大编号开始。
 
 ## 4. Test 模式
 
@@ -89,28 +91,36 @@ traj_N/
 traj_N/
 └── FK_state/
     ├── tcp_pose.npz        # timestamps, tcp_pose[N,7]
-    ├── joint_velocity.npz  # timestamps, joint_velocity[N,7]
-    ├── joint_pos.npz       # timestamps, joint_pos[N,7]
+    ├── joint_velocity.npz  # timestamps, joint_velocity[N,9]
+    ├── joint_pos.npz       # timestamps, joint_pos[N,9]
     └── gripper_events.npz  # 实际下发的夹爪事件
 ```
 
 其中 `tcp_pose` 顺序为 `x, y, z, qx, qy, qz, qw`。
+`joint_pos` 和 `joint_velocity` 的前 7 维为机械臂关节，后 2 维为
+`finger_joint1, finger_joint2`。
+
+如果目标轨迹已经存在 `FK_state/*.npz`，脚本会在开始 replay 前提示确认；
+输入 `yes` 才会继续覆盖旧输出。确认无误时也可以加 `--overwrite` 跳过提示。
 
 ## 7. 常用参数
 
 ```bash
 ros2 run franka_example_controllers ee_control_replay.py \
   --data_dir ~/robot_recordings/at \
+  --start_traj 0 \
   --record_rate 100 \
   --trajectory_smoothing_window 5 \
   --input_rate 100
 ```
 
+- `--start_traj`：从指定 `traj_N` 编号开始；不指定时命令行提示输入
 - `--record_rate`：记录 `FK_state` 的采样频率
 - `--trajectory_smoothing_window`：对 FK 位姿中的 position 做移动平均平滑；
   `<=1` 关闭
 - `--input_rate`：当 `EE_pose_FK.npz` 没有 timestamp 时使用的默认频率
 - `--finish_timeout`：等待单条轨迹结束的超时时间；`<=0` 表示一直等待
+- `--overwrite`：已有 `FK_state` 输出时不提示，直接覆盖
 
 ## 8. 控制器安全参数
 

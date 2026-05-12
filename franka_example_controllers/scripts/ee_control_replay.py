@@ -8,8 +8,8 @@ Input layout:
 
 Output layout:
     <data_dir>/traj_N/FK_state/tcp_pose.npz
-    <data_dir>/traj_N/FK_state/joint_velocity.npz
-    <data_dir>/traj_N/FK_state/joint_pos.npz
+    <data_dir>/traj_N/FK_state/joint_velocity.npz  (N, 9): 7 arm joints + 2 fingers
+    <data_dir>/traj_N/FK_state/joint_pos.npz       (N, 9): 7 arm joints + 2 fingers
 """
 
 import argparse
@@ -39,6 +39,7 @@ except ImportError as exc:
 
 
 ARM_JOINT_NAMES = [f"fr3_joint{i}" for i in range(1, 8)]
+FINGER_JOINT_NAMES = ("finger_joint1", "finger_joint2")
 TRAJ_DIR_PATTERN = re.compile(r"^traj_(\d+)$")
 DEFAULT_POSE_KEYS = (
     "end_effector_poses",
@@ -83,6 +84,10 @@ class EeControlReplay(Node):
         self.latest_tcp_pose = None
         self.latest_arm_q = None
         self.latest_arm_dq = None
+        self.latest_gripper_q = None
+        self.latest_gripper_dq = None
+        self.previous_gripper_q = None
+        self.previous_gripper_stamp = None
 
         self.state = self.STATE_IDLE
         self.current_traj_dir = None
@@ -159,6 +164,47 @@ class EeControlReplay(Node):
             return arm
         return None
 
+    def _extract_gripper_joint_vector(self, msg: JointState, field_name):
+        values = getattr(msg, field_name)
+        if len(values) == 0:
+            return None
+
+        gripper = [None, None]
+        if msg.name:
+            for i, name in enumerate(msg.name):
+                if i >= len(values):
+                    continue
+                if FINGER_JOINT_NAMES[0] in name:
+                    gripper[0] = float(values[i])
+                elif FINGER_JOINT_NAMES[1] in name:
+                    gripper[1] = float(values[i])
+        elif len(values) >= 9:
+            gripper = [float(values[7]), float(values[8])]
+
+        if all(v is not None for v in gripper):
+            return gripper
+        return None
+
+    def _estimate_gripper_velocity(self, msg: JointState, gripper_q):
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if stamp <= 0.0:
+            stamp = time.time()
+        if self.previous_gripper_q is None or self.previous_gripper_stamp is None:
+            self.previous_gripper_q = list(gripper_q)
+            self.previous_gripper_stamp = stamp
+            return [0.0, 0.0]
+
+        dt = stamp - self.previous_gripper_stamp
+        if dt <= 1e-6:
+            return [0.0, 0.0]
+        dq = [
+            (gripper_q[0] - self.previous_gripper_q[0]) / dt,
+            (gripper_q[1] - self.previous_gripper_q[1]) / dt,
+        ]
+        self.previous_gripper_q = list(gripper_q)
+        self.previous_gripper_stamp = stamp
+        return dq
+
     @staticmethod
     def _pose7_from_pose_stamped(pose_stamped):
         pose = pose_stamped.pose
@@ -186,11 +232,19 @@ class EeControlReplay(Node):
     def joint_state_cb(self, msg: JointState):
         arm = self._extract_arm_joint_vector(msg, "position")
         arm_dq = self._extract_arm_joint_vector(msg, "velocity")
+        gripper = self._extract_gripper_joint_vector(msg, "position")
+        gripper_dq = self._extract_gripper_joint_vector(msg, "velocity")
+        if gripper is not None and gripper_dq is None:
+            gripper_dq = self._estimate_gripper_velocity(msg, gripper)
         with self.lock:
             if arm is not None:
                 self.latest_arm_q = arm
             if arm_dq is not None:
                 self.latest_arm_dq = arm_dq
+            if gripper is not None:
+                self.latest_gripper_q = gripper
+            if gripper_dq is not None:
+                self.latest_gripper_dq = gripper_dq
 
     # ------------------------------------------------------------------
     # Replay callbacks and recording
@@ -224,18 +278,28 @@ class EeControlReplay(Node):
             return
         with self.lock:
             tcp_pose = list(self.latest_tcp_pose) if self.latest_tcp_pose else None
-            q = list(self.latest_arm_q) if self.latest_arm_q else None
-            dq = list(self.latest_arm_dq) if self.latest_arm_dq else None
+            arm_q = list(self.latest_arm_q) if self.latest_arm_q else None
+            arm_dq = list(self.latest_arm_dq) if self.latest_arm_dq else None
+            gripper_q = (
+                list(self.latest_gripper_q)
+                if self.latest_gripper_q is not None
+                else [float("nan"), float("nan")]
+            )
+            gripper_dq = (
+                list(self.latest_gripper_dq)
+                if self.latest_gripper_dq is not None
+                else [0.0, 0.0]
+            )
         t_rel = time.time() - self.replay_t0
         if tcp_pose is not None:
             self.tcp_times.append(t_rel)
             self.tcp_poses.append(tcp_pose)
-        if q is not None:
+        if arm_q is not None:
             self.q_times.append(t_rel)
-            self.q_values.append(q)
-        if dq is not None:
+            self.q_values.append(arm_q + gripper_q)
+        if arm_dq is not None:
             self.dq_times.append(t_rel)
-            self.dq_values.append(dq)
+            self.dq_values.append(arm_dq + gripper_dq)
 
     # ------------------------------------------------------------------
     # Main trajectory flow
@@ -601,14 +665,14 @@ class EeControlReplay(Node):
             "joint_velocity",
             self.dq_times,
             self.dq_values,
-            7,
+            9,
         )
         self._save_npz(
             os.path.join(state_dir, "joint_pos.npz"),
             "joint_pos",
             self.q_times,
             self.q_values,
-            7,
+            9,
         )
 
         ev_path = os.path.join(state_dir, "gripper_events.npz")
@@ -650,6 +714,58 @@ def discover_trajectories(data_dir):
     return [path for _, path in sorted(trajectories)]
 
 
+def trajectory_number(traj_dir):
+    name = os.path.basename(os.path.normpath(traj_dir))
+    match = TRAJ_DIR_PATTERN.match(name)
+    if not match:
+        raise ValueError(f"Invalid trajectory directory name: {traj_dir}")
+    return int(match.group(1))
+
+
+def filter_trajectories_from(trajectories, start_num):
+    return [
+        traj_dir for traj_dir in trajectories
+        if trajectory_number(traj_dir) >= start_num
+    ]
+
+
+def choose_start_trajectory(trajectories, start_num_arg):
+    available_nums = [trajectory_number(path) for path in trajectories]
+    min_num = min(available_nums)
+    max_num = max(available_nums)
+
+    if start_num_arg is not None:
+        selected = filter_trajectories_from(trajectories, int(start_num_arg))
+        if not selected:
+            raise ValueError(
+                f"No traj_N with N >= {start_num_arg}; "
+                f"available range is traj_{min_num}..traj_{max_num}"
+            )
+        return selected
+
+    while True:
+        raw = input("starting from traj num? ").strip()
+        try:
+            start_num = int(raw)
+        except ValueError:
+            print("Please enter an integer trajectory number.")
+            continue
+
+        selected = filter_trajectories_from(trajectories, start_num)
+        if selected:
+            first = trajectory_number(selected[0])
+            last = trajectory_number(selected[-1])
+            print(
+                f"Will replay {len(selected)} trajectory(s), "
+                f"from traj_{first} through traj_{last}."
+            )
+            return selected
+        print(
+            f"No traj_N with N >= {start_num}; "
+            f"available range is traj_{min_num}..traj_{max_num}."
+        )
+
+
 def find_pose_file(traj_dir, required=True):
     replay_dir = os.path.join(traj_dir, "replay")
     for filename in POSE_FILENAMES:
@@ -670,12 +786,52 @@ def prompt_data_dir(default):
             return os.path.expanduser(value)
 
 
+def existing_fk_outputs(traj_dir):
+    state_dir = os.path.join(traj_dir, "FK_state")
+    names = (
+        "tcp_pose.npz",
+        "joint_velocity.npz",
+        "joint_pos.npz",
+        "gripper_events.npz",
+    )
+    return [os.path.join(state_dir, name) for name in names
+            if os.path.exists(os.path.join(state_dir, name))]
+
+
+def confirm_overwrite_if_needed(trajectories, overwrite):
+    existing = [(traj_dir, existing_fk_outputs(traj_dir)) for traj_dir in trajectories]
+    existing = [(traj_dir, paths) for traj_dir, paths in existing if paths]
+    if not existing:
+        return
+    if overwrite:
+        print(
+            f"--overwrite set: will overwrite existing FK_state outputs for "
+            f"{len(existing)} trajectory(s)."
+        )
+        return
+
+    print("WARNING: replay will overwrite existing FK_state outputs.")
+    print(f"Affected trajectories: {len(existing)}")
+    for traj_dir, paths in existing[:10]:
+        names = ", ".join(os.path.basename(path) for path in paths)
+        print(f"  {os.path.basename(traj_dir)}: {names}")
+    if len(existing) > 10:
+        print(f"  ... {len(existing) - 10} more")
+    answer = input("Type 'yes' to continue and overwrite, or anything else to abort: ")
+    if answer.strip().lower() != "yes":
+        raise RuntimeError("Aborted before replay to avoid overwriting existing FK_state data")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", type=str, default="",
                         help="Folder containing traj_N directories")
     parser.add_argument("--test", action="store_true",
                         help="Replay one trajectory per keypress")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing traj_N/FK_state outputs without prompting")
+    parser.add_argument("--start_traj", type=int, default=None,
+                        help="Start replay from this traj_N number; default prompts")
     parser.add_argument("--record_rate", type=float, default=100.0,
                         help="FK_state recording rate in Hz")
     parser.add_argument("--input_rate", type=float, default=100.0,
@@ -717,6 +873,8 @@ def main():
     trajectories = discover_trajectories(data_dir)
     if not trajectories:
         raise FileNotFoundError(f"No traj_N/replay/EE_pose_FK.npz found under {data_dir}")
+    trajectories = choose_start_trajectory(trajectories, args.start_traj)
+    confirm_overwrite_if_needed(trajectories, args.overwrite)
 
     rclpy.init(args=sys.argv)
     node = EeControlReplay(args)
