@@ -381,19 +381,32 @@ controller_interface::return_type EePoseReplayController::update(
   if (phase == Phase::PRE_ROLL && active_trajectory_) {
     const auto& traj = *active_trajectory_;
     if (pre_roll_duration_ <= 0.0) {
-      if (!last_command_initialized_) {
-        last_command_position_ = current_position_;
-        last_command_orientation_ = current_orientation_;
-        last_command_initialized_ = true;
+      // Sanity check: refuse pre-roll if current pose looks like an uninitialized
+      // default (close to origin with identity orientation), which usually means
+      // the state interface hasn't been read yet. Fall back to HOLD so libfranka
+      // doesn't get fed a 50 cm command jump.
+      if (current_position_.norm() < 1e-3) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "PRE_ROLL aborted: current_position_ looks uninitialized "
+                    "(%.6f,%.6f,%.6f). Falling back to HOLD; try replay again.",
+                    current_position_.x(), current_position_.y(),
+                    current_position_.z());
+        phase_.store(static_cast<int>(Phase::HOLD));
+        hold_initialized_ = false;
+        pre_roll_duration_ = 0.0;
+        pre_roll_elapsed_ = 0.0;
+        return controller_interface::return_type::OK;
       }
-      pre_roll_position_start_ = last_command_position_;
-      pre_roll_orientation_start_ = last_command_orientation_;
+
+      pre_roll_position_start_ = current_position_;
+      pre_roll_orientation_start_ = current_orientation_;
       pre_roll_elapsed_ = 0.0;
 
-      const double translation_delta =
-          (traj.positions.front() - pre_roll_position_start_).norm();
+      const Eigen::Vector3d target_position = traj.positions.front();
+      const Eigen::Quaterniond target_orientation = traj.orientations.front();
+      const double translation_delta = (target_position - pre_roll_position_start_).norm();
       const double rotation_delta =
-          pre_roll_orientation_start_.angularDistance(traj.orientations.front());
+          pre_roll_orientation_start_.angularDistance(target_orientation);
       constexpr double kMinJerkPeakFactor = 1.875;
       pre_roll_duration_ =
           std::max({move_to_start_min_duration_,
@@ -405,6 +418,26 @@ controller_interface::return_type EePoseReplayController::update(
       RCLCPP_INFO(get_node()->get_logger(),
                   "EE pre-roll: translation %.4f m, rotation %.4f rad, duration %.2f s",
                   translation_delta, rotation_delta, pre_roll_duration_);
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "  start    pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
+          pre_roll_position_start_.x(), pre_roll_position_start_.y(),
+          pre_roll_position_start_.z(), pre_roll_orientation_start_.x(),
+          pre_roll_orientation_start_.y(), pre_roll_orientation_start_.z(),
+          pre_roll_orientation_start_.w());
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "  target   pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
+          target_position.x(), target_position.y(), target_position.z(),
+          target_orientation.x(), target_orientation.y(), target_orientation.z(),
+          target_orientation.w());
+      const Eigen::Vector3d last_cmd_drift =
+          last_command_initialized_
+              ? (current_position_ - last_command_position_)
+              : Eigen::Vector3d::Zero();
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "  current_vs_last_cmd drift=%.6f m (last_cmd_initialized=%d)",
+                  last_cmd_drift.norm(), last_command_initialized_ ? 1 : 0);
     }
 
     pre_roll_elapsed_ += period.seconds();
@@ -413,12 +446,23 @@ controller_interface::return_type EePoseReplayController::update(
         pre_roll_position_start_ + s * (traj.positions.front() - pre_roll_position_start_);
     orientation_command = pre_roll_orientation_start_.slerp(s, traj.orientations.front());
 
+    // First few ticks of pre-roll: print the commanded pose so we can see
+    // whether libfranka is being fed a jump.
+    if (pre_roll_elapsed_ <= 3.5 * period.seconds()) {
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "PRE_ROLL tick t=%.4f s=%.3e cmd_pos=(%.4f,%.4f,%.4f)",
+                  pre_roll_elapsed_, s, position_command.x(), position_command.y(),
+                  position_command.z());
+    }
+
     if (pre_roll_elapsed_ >= pre_roll_duration_) {
       phase_.store(static_cast<int>(Phase::TRACKING));
       pre_roll_duration_ = 0.0;
       pre_roll_elapsed_ = 0.0;
       tracking_initialized_ = false;
-      RCLCPP_INFO(get_node()->get_logger(), "EE pre-roll complete -> TRACKING");
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "EE pre-roll complete -> TRACKING; last cmd=(%.4f,%.4f,%.4f)",
+                  position_command.x(), position_command.y(), position_command.z());
     }
   } else if (phase == Phase::TRACKING && active_trajectory_) {
     const auto& traj = *active_trajectory_;
@@ -427,6 +471,15 @@ controller_interface::return_type EePoseReplayController::update(
       segment_index_ = 0;
       tracking_initialized_ = true;
       start_pending_ = true;
+      const Eigen::Vector3d traj_v0 = traj.linear_velocities.front();
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "TRACKING start: cur=(%.4f,%.4f,%.4f) traj[0]=(%.4f,%.4f,%.4f) "
+          "traj_v0=(%.4f,%.4f,%.4f) |v0|=%.4f m/s",
+          current_position_.x(), current_position_.y(), current_position_.z(),
+          traj.positions.front().x(), traj.positions.front().y(),
+          traj.positions.front().z(), traj_v0.x(), traj_v0.y(), traj_v0.z(),
+          traj_v0.norm());
     }
 
     replay_elapsed_ += period.seconds();
@@ -468,6 +521,13 @@ controller_interface::return_type EePoseReplayController::update(
       hold_position_ = current_position_;
       hold_orientation_ = current_orientation_;
       hold_initialized_ = true;
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "HOLD initialized: pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f) "
+          "|pos|=%.4f",
+          hold_position_.x(), hold_position_.y(), hold_position_.z(),
+          hold_orientation_.x(), hold_orientation_.y(), hold_orientation_.z(),
+          hold_orientation_.w(), hold_position_.norm());
     }
     position_command = hold_position_;
     orientation_command = hold_orientation_;
