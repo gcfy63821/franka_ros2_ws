@@ -73,6 +73,9 @@ EePoseReplayController::state_interface_configuration() const {
     config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
     config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/velocity");
   }
+  for (const auto& name : franka_cartesian_pose_->get_state_interface_names()) {
+    config.names.push_back(name);
+  }
   for (const auto& name : franka_robot_model_->get_state_interface_names()) {
     config.names.push_back(name);
   }
@@ -99,6 +102,10 @@ CallbackReturn EePoseReplayController::on_init() {
     fprintf(stderr, "EePoseReplayController init failed: %s\n", e.what());
     return CallbackReturn::ERROR;
   }
+
+  franka_cartesian_pose_ =
+      std::make_unique<franka_semantic_components::FrankaCartesianPoseInterface>(
+          franka_semantic_components::FrankaCartesianPoseInterface(k_elbow_activated_));
   return CallbackReturn::SUCCESS;
 }
 
@@ -186,6 +193,7 @@ CallbackReturn EePoseReplayController::on_configure(
 
 CallbackReturn EePoseReplayController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
+  franka_cartesian_pose_->assign_loaned_state_interfaces(state_interfaces_);
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
 
   // Note: we deliberately do NOT read joint/Cartesian state here. The first
@@ -224,6 +232,7 @@ CallbackReturn EePoseReplayController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   start_pub_->on_deactivate();
   finish_pub_->on_deactivate();
+  franka_cartesian_pose_->release_interfaces();
   franka_robot_model_->release_interfaces();
   return CallbackReturn::SUCCESS;
 }
@@ -382,12 +391,13 @@ void EePoseReplayController::updateJointStates() {
 }
 
 void EePoseReplayController::updateCurrentPose() {
-  std::array<double, 16> pose_array =
-      franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector);
-  Eigen::Matrix4d pose =
-      Eigen::Map<Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(pose_array.data());
-  current_position_ = pose.block<3, 1>(0, 3);
-  Eigen::Quaterniond q(pose.block<3, 3>(0, 0));
+  // Read O_T_EE directly from the cartesian pose state interface that the
+  // franka_hardware layer broadcasts. We deliberately bypass robot_model FK
+  // because getPoseMatrix(kEndEffector) on this stack does not return the
+  // base-frame EE pose we expect.
+  Eigen::Quaterniond q;
+  std::tie(q, current_position_) =
+      franka_cartesian_pose_->getCurrentOrientationAndTranslation();
   if (q.norm() <= 1e-9) {
     current_orientation_ = Eigen::Quaterniond::Identity();
   } else {

@@ -16,6 +16,7 @@
 
 #include <Eigen/Dense>
 #include <controller_interface/controller_interface.hpp>
+#include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
 #include <franka_semantic_components/franka_robot_model.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_publisher.hpp>
@@ -104,10 +105,16 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   Eigen::Matrix<double, 6, 6> cartesian_damping_;
   Vector7d nullspace_q_target_;
 
-  // Robot model semantic component for FK + Jacobian + Coriolis
+  // Robot model semantic component for Jacobian + Coriolis. We deliberately
+  // do NOT use it for FK (getPoseMatrix); on this stack it returns something
+  // other than base_T_EE. EE pose is read via the cartesian pose state
+  // interface instead, which the hardware broadcasts directly from O_T_EE.
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
+  std::unique_ptr<franka_semantic_components::FrankaCartesianPoseInterface>
+      franka_cartesian_pose_;
   const std::string k_robot_model_interface_name_{"robot_model"};
   const std::string k_robot_state_interface_name_{"robot_state"};
+  const bool k_elbow_activated_{false};
 
   // Joint state (read each tick from state_interfaces_)
   Vector7d q_;
