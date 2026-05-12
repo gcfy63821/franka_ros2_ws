@@ -431,10 +431,10 @@ controller_interface::return_type EePoseReplayController::update(
           target_position.x(), target_position.y(), target_position.z(),
           target_orientation.x(), target_orientation.y(), target_orientation.z(),
           target_orientation.w());
-      const Eigen::Vector3d last_cmd_drift =
-          last_command_initialized_
-              ? (current_position_ - last_command_position_)
-              : Eigen::Vector3d::Zero();
+      Eigen::Vector3d last_cmd_drift = Eigen::Vector3d::Zero();
+      if (last_command_initialized_) {
+        last_cmd_drift = current_position_ - last_command_position_;
+      }
       RCLCPP_INFO(get_node()->get_logger(),
                   "  current_vs_last_cmd drift=%.6f m (last_cmd_initialized=%d)",
                   last_cmd_drift.norm(), last_command_initialized_ ? 1 : 0);
