@@ -17,7 +17,9 @@
 #include <Eigen/Dense>
 #include <controller_interface/controller_interface.hpp>
 #include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
-#include <franka_semantic_components/franka_robot_model.hpp>
+#include <kdl/chain.hpp>
+#include <kdl/chainjnttojacsolver.hpp>
+#include <kdl/jntarray.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_publisher.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -32,12 +34,21 @@ namespace franka_example_controllers {
 
 // Replays end-effector poses with a Cartesian impedance controller.
 //
-// The controller follows the same external protocol as the previous version
-// (mode topic + MultiDOFJointTrajectory + start/finish booleans), but the
-// inner loop is torque-based: it reads joint states + Jacobian from the
-// franka_robot_model interface, computes the Cartesian pose error against a
-// smooth reference (HOLD / PRE_ROLL min-jerk / TRACKING cubic Hermite), and
-// emits joint efforts via tau = J^T (Kp*err + Kd*err_dot) + nullspace + coriolis.
+// Architecture:
+//   * EE pose state  : read from franka_cartesian_pose state interface (O_T_EE
+//                      broadcast by libfranka). franka_robot_model is NOT used
+//                      because its Jacobian/FK accessors return garbage on this
+//                      hardware stack.
+//   * Jacobian       : computed via KDL from the URDF (pulled from
+//                      robot_state_publisher's robot_description parameter).
+//   * Torque output  : joint efforts (effort command interface), which bypasses
+//                      libfranka's Cartesian motion generator and its
+//                      acceleration-discontinuity reflexes.
+//
+// External protocol is unchanged: mode topic ("hold" / "replay"),
+// MultiDOFJointTrajectory on trajectory topic, replay_started / replay_finished
+// booleans. Phase machine still goes HOLD -> PRE_ROLL (min-jerk move-to-start)
+// -> TRACKING (cubic Hermite over the recorded poses).
 class EePoseReplayController : public controller_interface::ControllerInterface {
  public:
   CallbackReturn on_init() override;
@@ -58,6 +69,7 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
 
   static constexpr int kNumJoints = 7;
   using Vector7d = Eigen::Matrix<double, 7, 1>;
+  using Matrix6x7d = Eigen::Matrix<double, 6, 7>;
 
   struct Trajectory {
     std::vector<double> times;
@@ -73,18 +85,18 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   void updateCurrentPose();
   void publishStarted();
   void publishFinished();
-
-  // Compute desired Cartesian pose for the current update tick (sets
-  // desired_position_/desired_orientation_, returns false if no command should
-  // be emitted this tick — e.g., when the sanity guard aborts pre-roll).
   bool computeDesiredPose(const rclcpp::Duration& period);
+  Vector7d computeImpedanceTorque(const Matrix6x7d& jacobian);
 
-  // Compute Cartesian impedance joint torques given current state and the
-  // desired pose stored in desired_position_/desired_orientation_.
-  Vector7d computeImpedanceTorque();
+  // Fetch URDF from /robot_state_publisher, build KDL chain + solver.
+  bool setupKdlFromUrdf();
+  // Compute base-frame Jacobian of the EE for the current q_ using KDL.
+  Matrix6x7d computeJacobian() const;
 
   // Parameters
   std::string arm_id_;
+  std::string base_link_;
+  std::string ee_link_;
   std::string mode_topic_;
   std::string trajectory_topic_;
   std::string start_topic_;
@@ -100,28 +112,28 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   double nullspace_stiffness_{10.0};
   double joint_damping_ratio_{1.0};
 
-  // Stiffness/damping matrices derived from the scalar parameters
   Eigen::Matrix<double, 6, 6> cartesian_stiffness_;
   Eigen::Matrix<double, 6, 6> cartesian_damping_;
   Vector7d nullspace_q_target_;
 
-  // Robot model semantic component for Jacobian + Coriolis. We deliberately
-  // do NOT use it for FK (getPoseMatrix); on this stack it returns something
-  // other than base_T_EE. EE pose is read via the cartesian pose state
-  // interface instead, which the hardware broadcasts directly from O_T_EE.
-  std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
+  // EE pose reader (state interface only).
   std::unique_ptr<franka_semantic_components::FrankaCartesianPoseInterface>
       franka_cartesian_pose_;
-  const std::string k_robot_model_interface_name_{"robot_model"};
-  const std::string k_robot_state_interface_name_{"robot_state"};
   const bool k_elbow_activated_{false};
+
+  // KDL chain + Jacobian solver, built from the URDF in on_configure.
+  std::string robot_description_;
+  KDL::Chain kdl_chain_;
+  std::unique_ptr<KDL::ChainJntToJacSolver> jac_solver_;
+  mutable KDL::JntArray kdl_q_;      // reused per tick
+  mutable KDL::Jacobian kdl_jac_;    // reused per tick
 
   // Joint state (read each tick from state_interfaces_)
   Vector7d q_;
   Vector7d dq_;
   Vector7d dq_filtered_;
 
-  // Current EE pose (read each tick via robot_model FK)
+  // Current EE pose (read each tick via cartesian_pose state interface)
   Eigen::Quaterniond current_orientation_{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d current_position_{Eigen::Vector3d::Zero()};
 
@@ -135,13 +147,10 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   bool hold_initialized_{false};
   std::atomic<bool> hold_reset_requested_{false};
 
-  // True until the first update() tick after activation has run, where we
-  // capture the initial pose/joint state from already-read state interfaces.
-  // We can't do this in on_activate because read() hasn't run yet there.
+  // Captured on first update() tick after activation, when state interfaces
+  // hold real values (on_activate runs before read()).
   bool needs_initialization_{true};
 
-  // Last commanded (smoothed) pose, used as PRE_ROLL start to guarantee
-  // continuity with the HOLD reference stream.
   Eigen::Quaterniond last_command_orientation_{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d last_command_position_{Eigen::Vector3d::Zero()};
   bool last_command_initialized_{false};

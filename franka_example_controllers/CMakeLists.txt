@@ -21,8 +21,10 @@ find_package(franka_msgs REQUIRED)
 find_package(franka_semantic_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(hardware_interface REQUIRED)
+find_package(kdl_parser REQUIRED)
 find_package(moveit_core REQUIRED)
 find_package(moveit_msgs REQUIRED)
+find_package(orocos_kdl REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -70,8 +72,10 @@ ament_target_dependencies(
         franka_semantic_components
         geometry_msgs
         hardware_interface
+        kdl_parser
         moveit_core
         moveit_msgs
+        orocos_kdl
         pinocchio
         pluginlib
         rclcpp

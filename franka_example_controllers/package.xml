@@ -13,6 +13,8 @@
   <depend>franka_msgs</depend>
   <depend>franka_semantic_components</depend>
   <depend>geometry_msgs</depend>
+  <depend>kdl_parser</depend>
+  <depend>orocos_kdl</depend>
   <depend>pinocchio</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>

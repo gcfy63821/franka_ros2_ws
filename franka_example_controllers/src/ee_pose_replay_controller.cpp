@@ -10,15 +10,20 @@
 
 #include <franka_example_controllers/default_robot_behavior_utils.hpp>
 #include <franka_example_controllers/robot_utils.hpp>
-#include <franka/robot_state.h>
+
+#include <kdl/tree.hpp>
+#include <kdl_parser/kdl_parser.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <exception>
 #include <string>
+
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -43,7 +48,8 @@ Eigen::Quaterniond normalizedQuaternion(double w, double x, double y, double z) 
   return q;
 }
 
-// Damped pseudo-inverse for the nullspace projection.
+// Damped right pseudo-inverse for a wide Jacobian (6x7) used in nullspace
+// projection. damping = 0.05 is conservative for Franka working space.
 Eigen::Matrix<double, 7, 6> dampedPseudoInverse(const Eigen::Matrix<double, 6, 7>& J,
                                                 double damping = 0.05) {
   Eigen::Matrix<double, 6, 6> JJt = J * J.transpose();
@@ -76,15 +82,14 @@ EePoseReplayController::state_interface_configuration() const {
   for (const auto& name : franka_cartesian_pose_->get_state_interface_names()) {
     config.names.push_back(name);
   }
-  for (const auto& name : franka_robot_model_->get_state_interface_names()) {
-    config.names.push_back(name);
-  }
   return config;
 }
 
 CallbackReturn EePoseReplayController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "fr3");
+    auto_declare<std::string>("base_link", "fr3_link0");
+    auto_declare<std::string>("ee_link", "fr3_hand_tcp");
     auto_declare<bool>("gazebo", false);
     auto_declare<std::string>("mode_topic", "/ee_pose_replay/mode");
     auto_declare<std::string>("trajectory_topic", "/ee_pose_replay/trajectory");
@@ -109,9 +114,77 @@ CallbackReturn EePoseReplayController::on_init() {
   return CallbackReturn::SUCCESS;
 }
 
+bool EePoseReplayController::setupKdlFromUrdf() {
+  // Fetch robot_description from /robot_state_publisher (same pattern as
+  // joint_impedance_with_ik_example_controller).
+  auto parameters_client =
+      std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "robot_state_publisher");
+  if (!parameters_client->wait_for_service(5s)) {
+    RCLCPP_FATAL(get_node()->get_logger(),
+                 "robot_state_publisher parameter service unavailable; can't read URDF");
+    return false;
+  }
+  auto future = parameters_client->get_parameters({"robot_description"});
+  if (future.wait_for(5s) != std::future_status::ready) {
+    RCLCPP_FATAL(get_node()->get_logger(), "Timed out waiting for robot_description");
+    return false;
+  }
+  auto result = future.get();
+  if (result.empty() || result[0].value_to_string().empty()) {
+    RCLCPP_FATAL(get_node()->get_logger(), "robot_description is empty");
+    return false;
+  }
+  robot_description_ = result[0].value_to_string();
+
+  KDL::Tree tree;
+  if (!kdl_parser::treeFromString(robot_description_, tree)) {
+    RCLCPP_FATAL(get_node()->get_logger(), "Failed to parse URDF into KDL tree");
+    return false;
+  }
+  if (!tree.getChain(base_link_, ee_link_, kdl_chain_)) {
+    RCLCPP_FATAL(get_node()->get_logger(),
+                 "Failed to extract KDL chain from '%s' to '%s'. Available links may differ; "
+                 "check the URDF.",
+                 base_link_.c_str(), ee_link_.c_str());
+    return false;
+  }
+  if (kdl_chain_.getNrOfJoints() != static_cast<unsigned int>(kNumJoints)) {
+    RCLCPP_FATAL(get_node()->get_logger(),
+                 "KDL chain has %u movable joints, expected %d. Check base_link/ee_link.",
+                 kdl_chain_.getNrOfJoints(), kNumJoints);
+    return false;
+  }
+  jac_solver_ = std::make_unique<KDL::ChainJntToJacSolver>(kdl_chain_);
+  kdl_q_.resize(kdl_chain_.getNrOfJoints());
+  kdl_jac_.resize(kdl_chain_.getNrOfJoints());
+
+  RCLCPP_INFO(get_node()->get_logger(),
+              "KDL chain built: base='%s' ee='%s' nr_joints=%u nr_segments=%u",
+              base_link_.c_str(), ee_link_.c_str(), kdl_chain_.getNrOfJoints(),
+              kdl_chain_.getNrOfSegments());
+  return true;
+}
+
+EePoseReplayController::Matrix6x7d EePoseReplayController::computeJacobian() const {
+  for (int i = 0; i < kNumJoints; ++i) {
+    kdl_q_(i) = q_(i);
+  }
+  jac_solver_->JntToJac(kdl_q_, kdl_jac_);
+  // KDL Jacobian rows: 0-2 linear, 3-5 angular, in the chain's root frame (= base_link_).
+  Matrix6x7d J;
+  for (int r = 0; r < 6; ++r) {
+    for (int c = 0; c < kNumJoints; ++c) {
+      J(r, c) = kdl_jac_(r, c);
+    }
+  }
+  return J;
+}
+
 CallbackReturn EePoseReplayController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
+  base_link_ = get_node()->get_parameter("base_link").as_string();
+  ee_link_ = get_node()->get_parameter("ee_link").as_string();
   gazebo_ = get_node()->get_parameter("gazebo").as_bool();
   mode_topic_ = get_node()->get_parameter("mode_topic").as_string();
   trajectory_topic_ = get_node()->get_parameter("trajectory_topic").as_string();
@@ -136,8 +209,6 @@ CallbackReturn EePoseReplayController::on_configure(
     return CallbackReturn::FAILURE;
   }
 
-  // Build constant stiffness / damping matrices. Damping uses the standard
-  // 2*sqrt(stiffness) rule (critically damped @ ratio = 1.0).
   cartesian_stiffness_.setZero();
   cartesian_stiffness_.topLeftCorner(3, 3) =
       translational_stiffness_ * Eigen::Matrix3d::Identity();
@@ -151,10 +222,9 @@ CallbackReturn EePoseReplayController::on_configure(
       2.0 * joint_damping_ratio_ * std::sqrt(rotational_stiffness_) *
       Eigen::Matrix3d::Identity();
 
-  franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
-      franka_semantic_components::FrankaRobotModel(
-          arm_id_ + "/" + k_robot_model_interface_name_,
-          arm_id_ + "/" + k_robot_state_interface_name_));
+  if (!setupKdlFromUrdf()) {
+    return CallbackReturn::ERROR;
+  }
 
   if (!gazebo_) {
     auto client = get_node()->create_client<franka_msgs::srv::SetFullCollisionBehavior>(
@@ -184,23 +254,19 @@ CallbackReturn EePoseReplayController::on_configure(
   finish_pub_ = get_node()->create_publisher<std_msgs::msg::Bool>(finish_topic_, rclcpp::QoS(10));
 
   RCLCPP_INFO(get_node()->get_logger(),
-              "EePoseReplayController (Cartesian impedance) configured. "
-              "mode_topic=%s trajectory_topic=%s K_t=%.1f K_r=%.1f K_n=%.1f",
-              mode_topic_.c_str(), trajectory_topic_.c_str(),
-              translational_stiffness_, rotational_stiffness_, nullspace_stiffness_);
+              "EePoseReplayController (Cartesian impedance, KDL Jacobian) configured. "
+              "K_t=%.1f K_r=%.1f K_n=%.1f damping_ratio=%.2f",
+              translational_stiffness_, rotational_stiffness_, nullspace_stiffness_,
+              joint_damping_ratio_);
   return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn EePoseReplayController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   franka_cartesian_pose_->assign_loaned_state_interfaces(state_interfaces_);
-  franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
 
-  // Note: we deliberately do NOT read joint/Cartesian state here. The first
-  // hardware read() runs *after* on_activate, so state interfaces still hold
-  // stale defaults at this point and a snapshot taken now would corrupt
-  // hold_position_ / nullspace_q_target_. The first update() tick captures
-  // them via the needs_initialization_ flag.
+  // Read-once happens after on_activate, so capture initial state on the first
+  // update() tick (via needs_initialization_ flag) instead of here.
   needs_initialization_ = true;
   dq_filtered_.setZero();
   hold_initialized_ = false;
@@ -233,7 +299,6 @@ CallbackReturn EePoseReplayController::on_deactivate(
   start_pub_->on_deactivate();
   finish_pub_->on_deactivate();
   franka_cartesian_pose_->release_interfaces();
-  franka_robot_model_->release_interfaces();
   return CallbackReturn::SUCCESS;
 }
 
@@ -384,17 +449,11 @@ void EePoseReplayController::updateJointStates() {
     q_(i) = state_interfaces_[2 * i].get_value();
     dq_(i) = state_interfaces_[2 * i + 1].get_value();
   }
-  // Mild low-pass filter on joint velocity for the damping term, to avoid
-  // amplifying encoder noise into tau.
   constexpr double kAlpha = 0.99;
   dq_filtered_ = (1.0 - kAlpha) * dq_filtered_ + kAlpha * dq_;
 }
 
 void EePoseReplayController::updateCurrentPose() {
-  // Read O_T_EE directly from the cartesian pose state interface that the
-  // franka_hardware layer broadcasts. We deliberately bypass robot_model FK
-  // because getPoseMatrix(kEndEffector) on this stack does not return the
-  // base-frame EE pose we expect.
   Eigen::Quaterniond q;
   std::tie(q, current_position_) =
       franka_cartesian_pose_->getCurrentOrientationAndTranslation();
@@ -428,8 +487,6 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
         return false;
       }
 
-      // Continuity: start from the last commanded pose, not from the noisy
-      // current measurement.
       pre_roll_position_start_ = last_command_position_;
       pre_roll_orientation_start_ = last_command_orientation_;
       pre_roll_elapsed_ = 0.0;
@@ -453,21 +510,13 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
                   translation_delta, rotation_delta, pre_roll_duration_);
       RCLCPP_INFO(
           get_node()->get_logger(),
-          "  start    pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
+          "  start    pos=(%.4f,%.4f,%.4f) target pos=(%.4f,%.4f,%.4f)",
           pre_roll_position_start_.x(), pre_roll_position_start_.y(),
-          pre_roll_position_start_.z(), pre_roll_orientation_start_.x(),
-          pre_roll_orientation_start_.y(), pre_roll_orientation_start_.z(),
-          pre_roll_orientation_start_.w());
-      RCLCPP_INFO(
-          get_node()->get_logger(),
-          "  target   pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
-          target_position.x(), target_position.y(), target_position.z(),
-          target_orientation.x(), target_orientation.y(), target_orientation.z(),
-          target_orientation.w());
-      Eigen::Vector3d last_cmd_drift = current_position_ - last_command_position_;
+          pre_roll_position_start_.z(), target_position.x(), target_position.y(),
+          target_position.z());
       RCLCPP_INFO(get_node()->get_logger(),
-                  "  current_vs_last_cmd drift=%.6f m",
-                  last_cmd_drift.norm());
+                  "  current vs last_cmd drift=%.6f m",
+                  (current_position_ - last_command_position_).norm());
     }
 
     pre_roll_elapsed_ += period.seconds();
@@ -476,14 +525,16 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
         pre_roll_position_start_ + s * (traj.positions.front() - pre_roll_position_start_);
     desired_orientation_ = pre_roll_orientation_start_.slerp(s, traj.orientations.front());
 
-    const bool early_tick = pre_roll_elapsed_ <= 3.5 * period.seconds();
-    const int slot = static_cast<int>(pre_roll_elapsed_ / 0.05);
-    if (early_tick || slot != last_pre_roll_log_slot_) {
+    const int slot = static_cast<int>(pre_roll_elapsed_ / 0.5);
+    if (slot != last_pre_roll_log_slot_) {
       last_pre_roll_log_slot_ = slot;
       RCLCPP_INFO(get_node()->get_logger(),
-                  "PRE_ROLL tick t=%.4f s=%.4e cmd_pos=(%.4f,%.4f,%.4f)",
-                  pre_roll_elapsed_, s, desired_position_.x(), desired_position_.y(),
-                  desired_position_.z());
+                  "PRE_ROLL t=%.2f/%.2f s=%.3f cmd=(%.3f,%.3f,%.3f) cur=(%.3f,%.3f,%.3f) "
+                  "|err|=%.4f",
+                  pre_roll_elapsed_, pre_roll_duration_, s,
+                  desired_position_.x(), desired_position_.y(), desired_position_.z(),
+                  current_position_.x(), current_position_.y(), current_position_.z(),
+                  (desired_position_ - current_position_).norm());
     }
 
     if (pre_roll_elapsed_ >= pre_roll_duration_) {
@@ -492,8 +543,9 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
       pre_roll_elapsed_ = 0.0;
       tracking_initialized_ = false;
       RCLCPP_INFO(get_node()->get_logger(),
-                  "EE pre-roll complete -> TRACKING; last cmd=(%.4f,%.4f,%.4f)",
-                  desired_position_.x(), desired_position_.y(), desired_position_.z());
+                  "EE pre-roll complete -> TRACKING; cmd=(%.4f,%.4f,%.4f) cur=(%.4f,%.4f,%.4f)",
+                  desired_position_.x(), desired_position_.y(), desired_position_.z(),
+                  current_position_.x(), current_position_.y(), current_position_.z());
     }
     return true;
   }
@@ -506,10 +558,10 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
       tracking_initialized_ = true;
       start_pending_ = true;
       RCLCPP_INFO(get_node()->get_logger(),
-                  "TRACKING start: cur=(%.4f,%.4f,%.4f) traj[0]=(%.4f,%.4f,%.4f)",
+                  "TRACKING start: cur=(%.4f,%.4f,%.4f) traj[0]=(%.4f,%.4f,%.4f) duration=%.2fs",
                   current_position_.x(), current_position_.y(), current_position_.z(),
                   traj.positions.front().x(), traj.positions.front().y(),
-                  traj.positions.front().z());
+                  traj.positions.front().z(), traj.times.back());
     }
 
     replay_elapsed_ += period.seconds();
@@ -523,7 +575,10 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
       finish_pending_ = true;
       phase_.store(static_cast<int>(Phase::HOLD));
       tracking_initialized_ = false;
-      RCLCPP_INFO(get_node()->get_logger(), "EE replay finished; reverted to HOLD");
+      RCLCPP_INFO(get_node()->get_logger(),
+                  "EE replay finished; cmd=(%.4f,%.4f,%.4f) cur=(%.4f,%.4f,%.4f)",
+                  desired_position_.x(), desired_position_.y(), desired_position_.z(),
+                  current_position_.x(), current_position_.y(), current_position_.z());
       return true;
     }
 
@@ -549,7 +604,7 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
     return true;
   }
 
-  // HOLD (default branch)
+  // HOLD branch
   if (!hold_initialized_) {
     hold_position_ = current_position_;
     hold_orientation_ = current_orientation_;
@@ -557,10 +612,9 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
     nullspace_q_target_ = q_;
     RCLCPP_INFO(
         get_node()->get_logger(),
-        "HOLD initialized: pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
+        "HOLD initialized: pos=(%.4f,%.4f,%.4f) q=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]",
         hold_position_.x(), hold_position_.y(), hold_position_.z(),
-        hold_orientation_.x(), hold_orientation_.y(), hold_orientation_.z(),
-        hold_orientation_.w());
+        q_(0), q_(1), q_(2), q_(3), q_(4), q_(5), q_(6));
   }
   desired_position_ = hold_position_;
   desired_orientation_ = hold_orientation_;
@@ -572,30 +626,9 @@ bool EePoseReplayController::computeDesiredPose(const rclcpp::Duration& period) 
   return true;
 }
 
-EePoseReplayController::Vector7d EePoseReplayController::computeImpedanceTorque() {
-  // Cartesian Jacobian at the EE in the base frame (6x7, row-major in
-  // libfranka's convention but stored column-major in the array).
-  std::array<double, 42> jacobian_array =
-      franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector);
-  Eigen::Matrix<double, 6, 7> jacobian =
-      Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::ColMajor>>(jacobian_array.data());
-
-  std::array<double, 7> coriolis_array = franka_robot_model_->getCoriolisForceVector();
-  Vector7d coriolis(coriolis_array.data());
-
-  // Diagnostic: print Jacobian magnitude and pos-error norm at low rate.
-  static int diag_counter = 0;
-  if (++diag_counter >= 100) {
-    diag_counter = 0;
-    Eigen::Vector3d pos_err = current_position_ - desired_position_;
-    RCLCPP_INFO(get_node()->get_logger(),
-                "DIAG: |pos_err|=%.4f m J_v_norm=%.3f J_w_norm=%.3f",
-                pos_err.norm(),
-                jacobian.topRows<3>().norm(),
-                jacobian.bottomRows<3>().norm());
-  }
-
-  // Cartesian pose error: position then orientation (axis-angle, base frame).
+EePoseReplayController::Vector7d EePoseReplayController::computeImpedanceTorque(
+    const Matrix6x7d& jacobian) {
+  // Pose error in base frame: [position, axis-angle].
   Eigen::Matrix<double, 6, 1> error;
   error.head<3>() = current_position_ - desired_position_;
 
@@ -605,38 +638,22 @@ EePoseReplayController::Vector7d EePoseReplayController::computeImpedanceTorque(
   }
   Eigen::Quaterniond error_quat(orientation_current.inverse() * desired_orientation_);
   Eigen::Vector3d orientation_error_local(error_quat.x(), error_quat.y(), error_quat.z());
-  // Rotate the error vector into the base frame; negate because err = current - desired.
   error.tail<3>() = -orientation_current.toRotationMatrix() * orientation_error_local;
 
-  // Task-space impedance torque: tau_task = J^T * (-K*err - D*(J*dq))
+  // Task-space impedance: tau_task = J^T * (-K*err - D*(J*dq))
   Vector7d tau_task =
       jacobian.transpose() *
       (-cartesian_stiffness_ * error - cartesian_damping_ * (jacobian * dq_filtered_));
 
-  // Nullspace torque pulling joints back to nullspace_q_target_ inside the
-  // task's nullspace, so unused joint DOF don't drift / blow up.
+  // Nullspace torque pulling q toward nullspace_q_target_.
   const double nullspace_damping = 2.0 * std::sqrt(std::max(nullspace_stiffness_, 0.0));
   Eigen::Matrix<double, 7, 6> J_pinv = dampedPseudoInverse(jacobian);
-  Eigen::Matrix<double, 7, 7> N = Eigen::Matrix<double, 7, 7>::Identity() -
-                                  jacobian.transpose() * J_pinv.transpose();
+  Eigen::Matrix<double, 7, 7> N =
+      Eigen::Matrix<double, 7, 7>::Identity() - jacobian.transpose() * J_pinv.transpose();
   Vector7d tau_null = N * (nullspace_stiffness_ * (nullspace_q_target_ - q_) -
                            nullspace_damping * dq_filtered_);
 
-  Vector7d tau = tau_task + tau_null + coriolis;
-
-  // Diagnostic: print torque breakdown at the same low rate.
-  if (diag_counter == 0) {
-    RCLCPP_INFO(get_node()->get_logger(),
-                "DIAG tau_task=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
-                "tau_null=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
-                "tau_tot=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f]",
-                tau_task(0), tau_task(1), tau_task(2), tau_task(3),
-                tau_task(4), tau_task(5), tau_task(6),
-                tau_null(0), tau_null(1), tau_null(2), tau_null(3),
-                tau_null(4), tau_null(5), tau_null(6),
-                tau(0), tau(1), tau(2), tau(3), tau(4), tau(5), tau(6));
-  }
-  return tau;
+  return tau_task + tau_null;
 }
 
 controller_interface::return_type EePoseReplayController::update(
@@ -644,15 +661,10 @@ controller_interface::return_type EePoseReplayController::update(
   updateJointStates();
   updateCurrentPose();
 
-  // Lazy initialization on the first tick after activation: by now read() has
-  // populated the state interfaces, so current_* and q_ are real values.
   if (needs_initialization_) {
     if (current_position_.norm() < 1e-3) {
-      // Robot model state still not ready (stale defaults). Emit zero torques
-      // this tick and try again next tick.
       RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
-                           "Waiting for franka_robot_model state to come up "
-                           "(current_position_=(%.4f,%.4f,%.4f))",
+                           "Waiting for valid EE pose (current_position_=(%.4f,%.4f,%.4f))",
                            current_position_.x(), current_position_.y(),
                            current_position_.z());
       for (int i = 0; i < kNumJoints; ++i) {
@@ -669,27 +681,41 @@ controller_interface::return_type EePoseReplayController::update(
     nullspace_q_target_ = q_;
     needs_initialization_ = false;
     RCLCPP_INFO(get_node()->get_logger(),
-                "EePoseReplayController init: HOLD pos=(%.4f,%.4f,%.4f) "
-                "quat=(%.4f,%.4f,%.4f,%.4f) q=(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f)",
+                "Init complete: HOLD pos=(%.4f,%.4f,%.4f) q=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]",
                 hold_position_.x(), hold_position_.y(), hold_position_.z(),
-                hold_orientation_.x(), hold_orientation_.y(),
-                hold_orientation_.z(), hold_orientation_.w(),
                 q_(0), q_(1), q_(2), q_(3), q_(4), q_(5), q_(6));
   }
 
   if (!computeDesiredPose(period)) {
-    // Sanity guard aborted; hold current pose by command (zero error -> zero
-    // task wrench), but still emit a valid torque so libfranka stays happy.
     desired_position_ = current_position_;
     desired_orientation_ = current_orientation_;
   }
 
-  Vector7d tau = computeImpedanceTorque();
+  Matrix6x7d jacobian = computeJacobian();
+  Vector7d tau = computeImpedanceTorque(jacobian);
+
+  // Sparse diagnostic: ~1 Hz, prints whether things look sane.
+  static int diag_counter = 0;
+  if (++diag_counter >= 1000) {
+    diag_counter = 0;
+    Eigen::Vector3d pos_err = current_position_ - desired_position_;
+    double j_v_norm = jacobian.topRows<3>().norm();
+    double j_w_norm = jacobian.bottomRows<3>().norm();
+    Phase phase = static_cast<Phase>(phase_.load());
+    const char* phase_str = phase == Phase::HOLD       ? "HOLD"
+                            : phase == Phase::PRE_ROLL ? "PRE_ROLL"
+                                                       : "TRACKING";
+    RCLCPP_INFO(get_node()->get_logger(),
+                "DIAG phase=%s |pos_err|=%.4fm |J_v|=%.2f |J_w|=%.2f "
+                "tau=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f]",
+                phase_str, pos_err.norm(), j_v_norm, j_w_norm,
+                tau(0), tau(1), tau(2), tau(3), tau(4), tau(5), tau(6));
+  }
+
   for (int i = 0; i < kNumJoints; ++i) {
     command_interfaces_[i].set_value(tau(i));
   }
 
-  // Track the last commanded reference (used as PRE_ROLL start for continuity).
   last_command_position_ = desired_position_;
   last_command_orientation_ = desired_orientation_;
   last_command_initialized_ = true;

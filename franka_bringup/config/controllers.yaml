@@ -430,6 +430,11 @@
   ee_pose_replay_controller:
     ros__parameters:
       arm_id: fr3
+      # KDL chain endpoints for Jacobian computation. ee_link should match
+      # libfranka's O_T_EE frame. For the standard Franka hand, that's
+      # fr3_hand_tcp; if you run without a hand, use fr3_link8.
+      base_link: fr3_link0
+      ee_link: fr3_hand_tcp
       gazebo: false
       mode_topic: "/ee_pose_replay/mode"
       trajectory_topic: "/ee_pose_replay/trajectory"
