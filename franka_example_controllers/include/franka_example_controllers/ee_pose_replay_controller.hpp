@@ -128,6 +128,11 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   bool hold_initialized_{false};
   std::atomic<bool> hold_reset_requested_{false};
 
+  // True until the first update() tick after activation has run, where we
+  // capture the initial pose/joint state from already-read state interfaces.
+  // We can't do this in on_activate because read() hasn't run yet there.
+  bool needs_initialization_{true};
+
   // Last commanded (smoothed) pose, used as PRE_ROLL start to guarantee
   // continuity with the HOLD reference stream.
   Eigen::Quaterniond last_command_orientation_{Eigen::Quaterniond::Identity()};

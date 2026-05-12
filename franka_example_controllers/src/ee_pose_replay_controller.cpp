@@ -188,20 +188,15 @@ CallbackReturn EePoseReplayController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
 
-  // Read initial joint state and capture as the nullspace target.
-  updateJointStates();
-  nullspace_q_target_ = q_;
+  // Note: we deliberately do NOT read joint/Cartesian state here. The first
+  // hardware read() runs *after* on_activate, so state interfaces still hold
+  // stale defaults at this point and a snapshot taken now would corrupt
+  // hold_position_ / nullspace_q_target_. The first update() tick captures
+  // them via the needs_initialization_ flag.
+  needs_initialization_ = true;
   dq_filtered_.setZero();
-
-  // Read initial EE pose so HOLD has a sane starting point even on the very
-  // first tick (before any update of current_position_ via robot_model FK).
-  updateCurrentPose();
-  hold_position_ = current_position_;
-  hold_orientation_ = current_orientation_;
-  hold_initialized_ = true;
-  last_command_position_ = current_position_;
-  last_command_orientation_ = current_orientation_;
-  last_command_initialized_ = true;
+  hold_initialized_ = false;
+  last_command_initialized_ = false;
 
   phase_.store(static_cast<int>(Phase::HOLD));
   active_trajectory_.reset();
@@ -220,11 +215,8 @@ CallbackReturn EePoseReplayController::on_activate(
   start_pub_->on_activate();
   finish_pub_->on_activate();
   RCLCPP_INFO(get_node()->get_logger(),
-              "EePoseReplayController activated in HOLD mode at "
-              "pos=(%.4f,%.4f,%.4f) quat=(%.4f,%.4f,%.4f,%.4f)",
-              hold_position_.x(), hold_position_.y(), hold_position_.z(),
-              hold_orientation_.x(), hold_orientation_.y(), hold_orientation_.z(),
-              hold_orientation_.w());
+              "EePoseReplayController activated; HOLD/nullspace will be captured "
+              "on the first update tick.");
   return CallbackReturn::SUCCESS;
 }
 
@@ -615,6 +607,39 @@ controller_interface::return_type EePoseReplayController::update(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
   updateJointStates();
   updateCurrentPose();
+
+  // Lazy initialization on the first tick after activation: by now read() has
+  // populated the state interfaces, so current_* and q_ are real values.
+  if (needs_initialization_) {
+    if (current_position_.norm() < 1e-3) {
+      // Robot model state still not ready (stale defaults). Emit zero torques
+      // this tick and try again next tick.
+      RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+                           "Waiting for franka_robot_model state to come up "
+                           "(current_position_=(%.4f,%.4f,%.4f))",
+                           current_position_.x(), current_position_.y(),
+                           current_position_.z());
+      for (int i = 0; i < kNumJoints; ++i) {
+        command_interfaces_[i].set_value(0.0);
+      }
+      return controller_interface::return_type::OK;
+    }
+    hold_position_ = current_position_;
+    hold_orientation_ = current_orientation_;
+    hold_initialized_ = true;
+    last_command_position_ = current_position_;
+    last_command_orientation_ = current_orientation_;
+    last_command_initialized_ = true;
+    nullspace_q_target_ = q_;
+    needs_initialization_ = false;
+    RCLCPP_INFO(get_node()->get_logger(),
+                "EePoseReplayController init: HOLD pos=(%.4f,%.4f,%.4f) "
+                "quat=(%.4f,%.4f,%.4f,%.4f) q=(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f)",
+                hold_position_.x(), hold_position_.y(), hold_position_.z(),
+                hold_orientation_.x(), hold_orientation_.y(),
+                hold_orientation_.z(), hold_orientation_.w(),
+                q_(0), q_(1), q_(2), q_(3), q_(4), q_(5), q_(6));
+  }
 
   if (!computeDesiredPose(period)) {
     // Sanity guard aborted; hold current pose by command (zero error -> zero
