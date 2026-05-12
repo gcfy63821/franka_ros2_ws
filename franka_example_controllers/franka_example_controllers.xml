@@ -122,4 +122,12 @@
             between adjacent points by time_from_start. Mode is switched via a topic.
         </description>
     </class>
+    <class name="franka_example_controllers/EePoseReplayController"
+           type="franka_example_controllers::EePoseReplayController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Replays dense end-effector pose trajectories through the Franka Cartesian pose command
+            interface. A min-jerk pre-roll moves from the current TCP pose to the first trajectory
+            pose before timed tracking starts.
+        </description>
+    </class>
 </library>

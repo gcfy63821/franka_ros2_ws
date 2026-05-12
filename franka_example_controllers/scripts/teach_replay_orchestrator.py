@@ -17,36 +17,43 @@ Workflow (single keyboard-driven session):
         we start the video writer and the joint-state recorder, and we
         schedule timers that re-issue gripper open/close actions at the
         recorded relative timestamps. /teach_replay/replay_finished closes
-        the video writer and saves the replay-side data.
+        the video writer and asks whether to save, dump, or replay again.
 
-    REPLAYING --> READY (auto on finish)
+    REPLAYING --> REVIEW (auto on finish)
+        Replay recording is kept pending. Choose whether to save it, dump the
+        whole teach/replay trajectory, or discard this replay and return to
+        READY so pressing 'r' records a fresh replay over the old one.
 
     any --[q]--> quit
 
-Files (per session, under <output_dir>/session_YYYYMMDD_HHMMSS/):
+Files (per trajectory, under <output_dir>/<save_data_folder>/traj_N/):
     teach/joint_trajectory.npz         (timestamps, joint_positions, gripper_widths)
     teach/gripper_events.npz           (relative_times, actions)
     replay/recording.avi               (video, optional)
     replay/joint_trajectory.npz        (executed joint positions)
+    replay/joint_velocities.npz        (executed joint velocities)
+    replay/end_effector_pose.npz       (executed EE pose [x y z qx qy qz qw])
     replay/gripper_events.npz          (gripper action issue timestamps)
 
 Usage:
     python3 teach_replay_orchestrator.py [--fps 30] [--record_rate 100]
         [--output_dir ~/robot_recordings]
-        [--image_topic /camera/camera/color/image_raw]
+        [--image_topic /camera/camera/color/image_raw/compressed]
         [--trajectory_smoothing_window 11]
+        [--raw_image]
         [--no_video]
 """
 
 import argparse
 import os
+import re
+import shutil
 import select
 import sys
 import termios
 import threading
 import time
 import tty
-from datetime import datetime
 
 import numpy as np
 import rclpy
@@ -55,7 +62,7 @@ from builtin_interfaces.msg import Duration as DurationMsg
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CompressedImage, Image, JointState
 from std_msgs.msg import Bool, Header, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -74,8 +81,15 @@ try:
 except ImportError:
     HAVE_GRIPPER_ACTIONS = False
 
+try:
+    from franka_msgs.msg import FrankaRobotState
+    HAVE_FRANKA_ROBOT_STATE = True
+except ImportError:
+    HAVE_FRANKA_ROBOT_STATE = False
+
 
 ARM_JOINT_NAMES = [f"fr3_joint{i}" for i in range(1, 8)]
+TRAJ_DIR_PATTERN = re.compile(r"^traj_(\d+)$")
 
 
 class TeachReplayOrchestrator(Node):
@@ -83,6 +97,7 @@ class TeachReplayOrchestrator(Node):
     STATE_TEACHING = "TEACHING"
     STATE_READY = "READY"
     STATE_REPLAYING = "REPLAYING"
+    STATE_REVIEW = "REVIEW"
 
     def __init__(self, args):
         super().__init__("teach_replay_orchestrator")
@@ -91,8 +106,11 @@ class TeachReplayOrchestrator(Node):
         self.trajectory_smoothing_window = args.trajectory_smoothing_window
         self.output_dir = os.path.expanduser(args.output_dir)
         self.image_topic = args.image_topic
+        self.use_compressed_image = not args.raw_image
         self.record_video = (not args.no_video) and HAVE_CV
         os.makedirs(self.output_dir, exist_ok=True)
+        self.save_data_dir = self._prompt_save_data_dir()
+        self.next_traj_index = self._get_next_traj_index()
 
         # Session state
         self.state = self.STATE_IDLE
@@ -101,6 +119,8 @@ class TeachReplayOrchestrator(Node):
 
         # Joint state cache
         self.latest_arm_q = None      # 7-vector
+        self.latest_arm_dq = None     # 7-vector
+        self.latest_ee_pose = None    # [x, y, z, qx, qy, qz, qw]
         self.latest_gripper = None    # (finger1, finger2)
 
         # Teach buffers
@@ -114,6 +134,10 @@ class TeachReplayOrchestrator(Node):
         self.replay_t0 = None
         self.replay_times = []
         self.replay_q = []
+        self.replay_dq_times = []
+        self.replay_dq = []
+        self.replay_ee_times = []
+        self.replay_ee_pose = []
         self.replay_event_log = []    # (rel_time_at_call, action)
         self.replay_video_path = None
         self.video_writer = None
@@ -135,6 +159,21 @@ class TeachReplayOrchestrator(Node):
         self.joint_sub = self.create_subscription(
             JointState, "/joint_states", self.joint_state_cb, qos
         )
+        self.robot_state_sub = None
+        if HAVE_FRANKA_ROBOT_STATE:
+            self.robot_state_sub = self.create_subscription(
+                FrankaRobotState,
+                "/franka_robot_state_broadcaster/robot_state",
+                self.robot_state_cb,
+                qos,
+            )
+            self.get_logger().info(
+                "Recording EE pose from /franka_robot_state_broadcaster/robot_state"
+            )
+        else:
+            self.get_logger().warn(
+                "franka_msgs/FrankaRobotState not importable; EE pose recording disabled"
+            )
         self.replay_started_sub = self.create_subscription(
             Bool, "/teach_replay/replay_started", self.replay_started_cb, qos
         )
@@ -143,10 +182,15 @@ class TeachReplayOrchestrator(Node):
         )
 
         if self.record_video:
+            image_msg_type = CompressedImage if self.use_compressed_image else Image
+            image_cb = self.compressed_image_cb if self.use_compressed_image else self.image_cb
             self.image_sub = self.create_subscription(
-                Image, self.image_topic, self.image_cb, qos_profile_sensor_data
+                image_msg_type, self.image_topic, image_cb, qos_profile_sensor_data
             )
-            self.get_logger().info(f"Video enabled, image_topic={self.image_topic}")
+            transport = "compressed" if self.use_compressed_image else "raw"
+            self.get_logger().info(
+                f"Video enabled, image_topic={self.image_topic}, transport={transport}"
+            )
         else:
             if not HAVE_CV and not args.no_video:
                 self.get_logger().warn(
@@ -191,6 +235,7 @@ class TeachReplayOrchestrator(Node):
         self.get_logger().info("  c : gripper CLOSE (during teach)")
         self.get_logger().info("  s : stop teaching, save trajectory")
         self.get_logger().info("  r : replay last teach + record video/joints")
+        self.get_logger().info("  after replay: [1/s] save, [2/d] dump, [3/r] replay again")
         self.get_logger().info("  h : home gripper")
         self.get_logger().info("  q : quit")
         self.get_logger().info("=" * 60)
@@ -200,28 +245,75 @@ class TeachReplayOrchestrator(Node):
         self.state = new_state
         self.get_logger().info(f"State: {old} -> {new_state}")
 
+    def _prompt_save_data_dir(self):
+        while True:
+            folder_name = input("enter save data folder name: ").strip()
+            if not folder_name:
+                print("Folder name cannot be empty.", file=sys.stderr)
+                continue
+            if os.path.isabs(folder_name) or os.path.basename(folder_name) != folder_name:
+                print("Enter a folder name only, not a path.", file=sys.stderr)
+                continue
+            data_dir = os.path.join(self.output_dir, folder_name)
+            os.makedirs(data_dir, exist_ok=True)
+            self.get_logger().info(f"Save data folder: {data_dir}")
+            return data_dir
+
+    def _get_next_traj_index(self):
+        max_index = -1
+        for name in os.listdir(self.save_data_dir):
+            path = os.path.join(self.save_data_dir, name)
+            match = TRAJ_DIR_PATTERN.match(name)
+            if match and os.path.isdir(path):
+                max_index = max(max_index, int(match.group(1)))
+        return max_index + 1
+
     def ensure_session_dir(self):
         if self.session_dir is None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.session_dir = os.path.join(self.output_dir, f"session_{ts}")
+            while True:
+                candidate = os.path.join(self.save_data_dir, f"traj_{self.next_traj_index}")
+                self.next_traj_index += 1
+                if not os.path.exists(candidate):
+                    self.session_dir = candidate
+                    break
             os.makedirs(os.path.join(self.session_dir, "teach"), exist_ok=True)
             os.makedirs(os.path.join(self.session_dir, "replay"), exist_ok=True)
-            self.get_logger().info(f"Session dir: {self.session_dir}")
+            self.get_logger().info(f"Trajectory dir: {self.session_dir}")
         return self.session_dir
 
     # ------------------------------------------------------------------
     # Subscriptions
     # ------------------------------------------------------------------
+    def _extract_arm_joint_vector(self, msg: JointState, field_name):
+        values = getattr(msg, field_name)
+        if len(values) == 0:
+            return None
+
+        arm = [None] * 7
+        if msg.name:
+            for i, name in enumerate(msg.name):
+                if i >= len(values):
+                    continue
+                try:
+                    joint_idx = ARM_JOINT_NAMES.index(name)
+                except ValueError:
+                    continue
+                arm[joint_idx] = float(values[i])
+        elif len(values) >= 7:
+            arm = [float(x) for x in values[:7]]
+
+        if all(v is not None for v in arm):
+            return arm
+        return None
+
     def joint_state_cb(self, msg: JointState):
         # /joint_states aggregates arm + gripper. Pull arm joints by name to
         # avoid index assumptions; fall back to first 7 if names absent.
-        arm = [None] * 7
+        arm = self._extract_arm_joint_vector(msg, "position")
+        arm_dq = self._extract_arm_joint_vector(msg, "velocity")
         gripper = [None, None]
         if msg.name:
             for i, name in enumerate(msg.name):
-                for j, target in enumerate(ARM_JOINT_NAMES):
-                    if name == target and i < len(msg.position):
-                        arm[j] = msg.position[i]
                 if "finger_joint1" in name and i < len(msg.position):
                     gripper[0] = msg.position[i]
                 elif "finger_joint2" in name and i < len(msg.position):
@@ -233,10 +325,37 @@ class TeachReplayOrchestrator(Node):
                 gripper = [msg.position[7], msg.position[8]]
 
         with self.lock:
-            if all(v is not None for v in arm):
+            if arm is not None:
                 self.latest_arm_q = arm
+            if arm_dq is not None:
+                self.latest_arm_dq = arm_dq
             if all(v is not None for v in gripper):
                 self.latest_gripper = gripper
+
+    @staticmethod
+    def _pose7_from_pose_stamped(pose_stamped):
+        pose = pose_stamped.pose
+        return [
+            float(pose.position.x),
+            float(pose.position.y),
+            float(pose.position.z),
+            float(pose.orientation.x),
+            float(pose.orientation.y),
+            float(pose.orientation.z),
+            float(pose.orientation.w),
+        ]
+
+    def robot_state_cb(self, msg: "FrankaRobotState"):
+        arm = self._extract_arm_joint_vector(msg.measured_joint_state, "position")
+        arm_dq = self._extract_arm_joint_vector(msg.measured_joint_state, "velocity")
+        ee_pose = self._pose7_from_pose_stamped(msg.o_t_ee)
+
+        with self.lock:
+            if arm is not None:
+                self.latest_arm_q = arm
+            if arm_dq is not None:
+                self.latest_arm_dq = arm_dq
+            self.latest_ee_pose = ee_pose
 
     def image_cb(self, msg: Image):
         try:
@@ -244,6 +363,20 @@ class TeachReplayOrchestrator(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"image conversion failed: {exc}")
             return
+        self._handle_video_frame(frame)
+
+    def compressed_image_cb(self, msg: CompressedImage):
+        try:
+            data = np.frombuffer(msg.data, dtype=np.uint8)
+            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if frame is None:
+                raise RuntimeError("cv2.imdecode returned None")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"compressed image decode failed: {exc}")
+            return
+        self._handle_video_frame(frame)
+
+    def _handle_video_frame(self, frame):
         with self.image_lock:
             self.latest_image = frame
         # Write a frame if video active. We push frames at image rate so the
@@ -264,8 +397,12 @@ class TeachReplayOrchestrator(Node):
         self.replay_t0 = time.time()
         self.replay_times = []
         self.replay_q = []
+        self.replay_dq_times = []
+        self.replay_dq = []
+        self.replay_ee_times = []
+        self.replay_ee_pose = []
         self.replay_event_log = []
-        self.get_logger().info("Replay started; recording joints/video")
+        self.get_logger().info("Replay started; recording joints/velocities/EE pose/video")
 
         if self.record_video and self.latest_image is not None:
             self._open_video_writer()
@@ -290,11 +427,11 @@ class TeachReplayOrchestrator(Node):
             return
         if self.state != self.STATE_REPLAYING:
             return
-        self.get_logger().info("Replay finished; saving data")
+        self.get_logger().info("Replay finished; waiting for review decision")
         self._cancel_scheduled_events()
         self._close_video_writer()
-        self._save_replay_data()
-        self.transition(self.STATE_READY)
+        self.transition(self.STATE_REVIEW)
+        self._print_replay_review_prompt()
 
     # ------------------------------------------------------------------
     # Recording timer
@@ -302,6 +439,8 @@ class TeachReplayOrchestrator(Node):
     def record_tick(self):
         with self.lock:
             arm = list(self.latest_arm_q) if self.latest_arm_q else None
+            arm_dq = list(self.latest_arm_dq) if self.latest_arm_dq else None
+            ee_pose = list(self.latest_ee_pose) if self.latest_ee_pose else None
             grip = list(self.latest_gripper) if self.latest_gripper else None
         now = time.time()
 
@@ -312,8 +451,15 @@ class TeachReplayOrchestrator(Node):
             self.teach_q.append(arm)
             self.teach_gripper.append(grip if grip else [float("nan"), float("nan")])
         elif self.state == self.STATE_REPLAYING and self.replay_t0 is not None and arm is not None:
-            self.replay_times.append(now - self.replay_t0)
+            t_rel = now - self.replay_t0
+            self.replay_times.append(t_rel)
             self.replay_q.append(arm)
+            if arm_dq is not None:
+                self.replay_dq_times.append(t_rel)
+                self.replay_dq.append(arm_dq)
+            if ee_pose is not None:
+                self.replay_ee_times.append(t_rel)
+                self.replay_ee_pose.append(ee_pose)
 
     # ------------------------------------------------------------------
     # Keyboard handling
@@ -334,6 +480,9 @@ class TeachReplayOrchestrator(Node):
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
     def _handle_key(self, key):
+        if self.state == self.STATE_REVIEW:
+            self._handle_replay_review_key(key)
+            return
         if key == "t":
             self.cmd_start_teach()
         elif key == "s":
@@ -350,6 +499,25 @@ class TeachReplayOrchestrator(Node):
             # ignore other keys silently to avoid log spam
             return
 
+    def _print_replay_review_prompt(self):
+        self.get_logger().info("Replay finished. Choose one:")
+        self.get_logger().info("  [1] save         : keep this replay recording")
+        self.get_logger().info("  [2] dump         : delete this replay and its teach trajectory")
+        self.get_logger().info("  [3] replay again : discard this replay; press 'r' again to re-record")
+        self.get_logger().info("Shortcuts: s=save, d=dump, r=replay again")
+
+    def _handle_replay_review_key(self, key):
+        if key in ("1", "s"):
+            self.cmd_review_save()
+        elif key in ("2", "d"):
+            self.cmd_review_dump()
+        elif key in ("3", "r"):
+            self.cmd_review_replay_again()
+        else:
+            self.get_logger().warn(
+                "Replay review pending: press 1/s to save, 2/d to dump, or 3/r to replay again"
+            )
+
     # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
@@ -357,7 +525,7 @@ class TeachReplayOrchestrator(Node):
         if self.state != self.STATE_IDLE and self.state != self.STATE_READY:
             self.get_logger().warn(f"Cannot start teach in state {self.state}")
             return
-        # Reset session: a fresh teach starts a new session folder so old
+        # Reset session: a fresh teach starts a new trajectory folder so old
         # data is not overwritten.
         self.session_dir = None
         self.ensure_session_dir()
@@ -438,6 +606,33 @@ class TeachReplayOrchestrator(Node):
             self.get_logger().info(f"Replay: gripper {label} @ t={t_rel:.2f}s")
         else:
             self.get_logger().info(f"Gripper {label} (not recording)")
+
+    def cmd_review_save(self):
+        if self.state != self.STATE_REVIEW:
+            self.get_logger().warn(f"Cannot save replay in state {self.state}")
+            return
+        self._save_replay_data()
+        self.transition(self.STATE_READY)
+        self.get_logger().info("Replay saved. Press 't' for a new teach or 'r' to replay this teach again.")
+
+    def cmd_review_dump(self):
+        if self.state != self.STATE_REVIEW:
+            self.get_logger().warn(f"Cannot dump replay in state {self.state}")
+            return
+        session_dir = self.session_dir
+        self._delete_current_session_dir()
+        self._reset_current_trajectory()
+        self.transition(self.STATE_IDLE)
+        self.get_logger().info(f"Dumped trajectory: {session_dir}. Press 't' to teach a new trajectory.")
+
+    def cmd_review_replay_again(self):
+        if self.state != self.STATE_REVIEW:
+            self.get_logger().warn(f"Cannot replay again in state {self.state}")
+            return
+        self._clear_replay_outputs()
+        self._reset_replay_buffers()
+        self.transition(self.STATE_READY)
+        self.get_logger().info("Current replay discarded. Press 'r' to replay again and overwrite replay data.")
 
     # ------------------------------------------------------------------
     # Trajectory packaging
@@ -621,7 +816,64 @@ class TeachReplayOrchestrator(Node):
             if self.video_writer is not None:
                 self.video_writer.release()
                 self.video_writer = None
-                self.get_logger().info(f"Video saved: {self.replay_video_path}")
+                self.get_logger().info(f"Video recording closed: {self.replay_video_path}")
+
+    # ------------------------------------------------------------------
+    # Trajectory cleanup / retry helpers
+    # ------------------------------------------------------------------
+    def _safe_session_dir(self):
+        if self.session_dir is None:
+            return None
+        save_data_dir = os.path.realpath(self.save_data_dir)
+        session_dir = os.path.realpath(self.session_dir)
+        if os.path.commonpath([save_data_dir, session_dir]) != save_data_dir:
+            raise RuntimeError(f"Refusing to modify path outside save dir: {session_dir}")
+        if not TRAJ_DIR_PATTERN.match(os.path.basename(session_dir)):
+            raise RuntimeError(f"Refusing to modify non-trajectory dir: {session_dir}")
+        return session_dir
+
+    def _clear_replay_outputs(self):
+        session_dir = self._safe_session_dir()
+        if session_dir is None:
+            return
+        replay_dir = os.path.join(session_dir, "replay")
+        if not os.path.isdir(replay_dir):
+            os.makedirs(replay_dir, exist_ok=True)
+            return
+        for name in os.listdir(replay_dir):
+            path = os.path.join(replay_dir, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        self.get_logger().info(f"Cleared replay outputs: {replay_dir}")
+
+    def _delete_current_session_dir(self):
+        session_dir = self._safe_session_dir()
+        if session_dir is None or not os.path.exists(session_dir):
+            return
+        shutil.rmtree(session_dir)
+
+    def _reset_replay_buffers(self):
+        self.replay_t0 = None
+        self.replay_times = []
+        self.replay_q = []
+        self.replay_dq_times = []
+        self.replay_dq = []
+        self.replay_ee_times = []
+        self.replay_ee_pose = []
+        self.replay_event_log = []
+        self.replay_video_path = None
+
+    def _reset_current_trajectory(self):
+        self.session_dir = None
+        self.teach_t0 = None
+        self.teach_times = []
+        self.teach_q = []
+        self.teach_gripper = []
+        self.teach_events = []
+        self.recorded_trajectory = None
+        self._reset_replay_buffers()
 
     # ------------------------------------------------------------------
     # Persistence
@@ -647,16 +899,38 @@ class TeachReplayOrchestrator(Node):
         self.get_logger().info(f"Wrote {ev_path}")
 
     def _save_replay_data(self):
-        if not self.replay_times:
-            self.get_logger().warn("No replay samples captured")
-            return
-        path = os.path.join(self.session_dir, "replay", "joint_trajectory.npz")
-        np.savez(
-            path,
-            timestamps=np.asarray(self.replay_times),
-            joint_positions=np.asarray(self.replay_q),
-        )
-        self.get_logger().info(f"Wrote {path}")
+        if self.replay_times:
+            path = os.path.join(self.session_dir, "replay", "joint_trajectory.npz")
+            np.savez(
+                path,
+                timestamps=np.asarray(self.replay_times),
+                joint_positions=np.asarray(self.replay_q),
+            )
+            self.get_logger().info(f"Wrote {path}")
+        else:
+            self.get_logger().warn("No replay joint-position samples captured")
+
+        if self.replay_dq_times:
+            dq_path = os.path.join(self.session_dir, "replay", "joint_velocities.npz")
+            np.savez(
+                dq_path,
+                timestamps=np.asarray(self.replay_dq_times),
+                joint_velocities=np.asarray(self.replay_dq),
+            )
+            self.get_logger().info(f"Wrote {dq_path}")
+        else:
+            self.get_logger().warn("No replay joint-velocity samples captured")
+
+        if self.replay_ee_times:
+            ee_path = os.path.join(self.session_dir, "replay", "end_effector_pose.npz")
+            np.savez(
+                ee_path,
+                timestamps=np.asarray(self.replay_ee_times),
+                end_effector_poses=np.asarray(self.replay_ee_pose),
+            )
+            self.get_logger().info(f"Wrote {ee_path}")
+        else:
+            self.get_logger().warn("No replay end-effector pose samples captured")
 
         ev_path = os.path.join(self.session_dir, "replay", "gripper_events.npz")
         if self.replay_event_log:
@@ -689,8 +963,10 @@ def main():
                         default="~/robot_recordings",
                         help="Output directory (default: ~/robot_recordings)")
     parser.add_argument("--image_topic", type=str,
-                        default="/camera/camera/color/image_raw",
+                        default="/camera/camera/color/image_raw/compressed",
                         help="Image topic for video recording")
+    parser.add_argument("--raw_image", action="store_true",
+                        help="Subscribe to raw sensor_msgs/Image instead of compressed image")
     parser.add_argument("--no_video", action="store_true",
                         help="Disable video recording (joint-only mode)")
     args = parser.parse_args()

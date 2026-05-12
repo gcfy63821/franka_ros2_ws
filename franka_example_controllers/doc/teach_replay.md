@@ -1,6 +1,6 @@
 # Teach & Replay 使用文档
 
-`TeachReplayController` + `teach_replay_orchestrator.py` 的完整使用流程：手动拖动机械臂示教轨迹，再让机械臂自动重放并采集视频与关节数据。
+`TeachReplayController` + `teach_replay_orchestrator.py` 的完整使用流程：手动拖动机械臂示教轨迹，再让机械臂自动重放并采集视频、关节位置、关节速度和末端位姿数据。
 
 ---
 
@@ -48,28 +48,44 @@ ros2 launch franka_bringup teach_replay.launch.py
 
 ### 终端 2：相机（如需录像）
 
+务必用本仓库安装后的 D455 配置启动相机：
+
 ```bash
 ros2 launch realsense2_camera rs_launch.py \
   config_file:=/home/robot/franka_ros2_ws/install/franka_bringup/share/franka_bringup/config/realsense_d455.yaml
 ```
 
-默认配置使用 D455 彩色流 `640x480x30`，图像 topic 为 `/camera/camera/color/image_raw`。如果用其它相机，启动 orchestrator 时加 `--image_topic <topic>`。
+默认配置使用 D455 彩色流 `640x480x30`，关闭 depth / infra / IMU，并发布 raw + compressed 彩色图像。orchestrator 默认订阅 `/camera/camera/color/image_raw/compressed`，避开 Python 订阅 raw 大消息时的掉帧问题。如果用其它相机，启动 orchestrator 时加 `--image_topic <topic>`；如果必须订阅 raw 图像，再加 `--raw_image`。
+
+启动后建议先确认实际参数和帧率：
+
+```bash
+ros2 param get /camera/camera rgb_camera.color_profile
+ros2 param get /camera/camera enable_depth
+ros2 param get /camera/camera camera.color.image_raw.enable_pub_plugins
+ros2 topic hz /camera/camera/color/image_raw/compressed
+```
+
+期望结果是 `rgb_camera.color_profile = 640x480x30`、`enable_depth = False`、插件包含 `image_transport/compressed`、compressed topic 接近 30 Hz。若直接用 RealSense 默认启动命令，可能会跑成 `1280x720x30` 且 depth 开启；若订阅 raw `/camera/camera/color/image_raw`，Python 端也可能因为大消息传输/反序列化掉到十几 Hz，最终 replay 视频只能记录到十几 Hz。
 
 ### 终端 3：键盘编排节点
 
 ```bash
 ros2 run franka_example_controllers teach_replay_orchestrator.py
+enter save data folder name: task1
 # 可选参数:
 #   --fps 30                 输出视频帧率
 #   --record_rate 100        teach/replay 时关节角采样率（Hz）
 #   --trajectory_smoothing_window 11
 #                            replay 前对示教关节轨迹做移动平均平滑；<=1 关闭
 #   --output_dir ~/robot_recordings
-#   --image_topic /camera/camera/color/image_raw
+#   --image_topic /camera/camera/color/image_raw/compressed
+#   --raw_image              订阅 raw sensor_msgs/Image；默认订阅 compressed 图像
 #   --no_video               关掉视频录制（仅记关节）
 ```
 
 > 此终端会把键盘切成 raw mode，所以**所有按键都要在该终端窗口里按**。
+> 启动时先输入本次采集保存的任务文件夹名，例如 `task1`；脚本会在 `~/robot_recordings/task1/` 中继续创建下一个 `traj_N`。
 
 ---
 
@@ -77,49 +93,60 @@ ros2 run franka_example_controllers teach_replay_orchestrator.py
 
 | 键 | 阶段 | 动作 |
 |---|---|---|
-| `t` | IDLE / READY | 进入 TEACH，零力矩；新建 session 文件夹 |
+| `t` | IDLE / READY | 进入 TEACH，零力矩；新建下一个 `traj_N` 文件夹 |
 | `o` | TEACHING | 张开夹爪（调用 `Move` action，width=0.08m）+ 记录事件 |
 | `c` | TEACHING | 闭合夹爪（调用 `Grasp` action，force=20N）+ 记录事件 |
 | `s` | TEACHING | 停止示教，保存 teach 数据 → READY |
-| `r` | READY | 发布轨迹 + 切到 REPLAY 模式，自动开始录像和记录关节 |
+| `r` | READY | 发布轨迹 + 切到 REPLAY 模式，自动开始录像和记录 replay 数据 |
+| `1` / `s` | replay 结束后 | 保存本次 replay 数据 |
+| `2` / `d` | replay 结束后 | 删除这条 replay 和对应 teach 轨迹 |
+| `3` / `r` | replay 结束后 | 丢弃本次 replay；回到 READY 后再按一次 `r` 重新 replay |
 | `h` | any | 夹爪 homing（标定行程） |
 | `q` | any | 退出 |
 
-REPLAY 自动结束后状态回到 READY，可再按 `r` 重放、或按 `t` 重新示教。
+REPLAY 自动结束后会停在 review 状态，必须选择 save / dump / replay again 之一。
 
 ---
 
 ## 5. 一次完整 session 的典型操作
 
-1. 终端 1、2、3 全部启动，确认 orchestrator 打印出 `Gripper action clients created`
+1. 终端 1、2、3 全部启动，在终端 3 输入保存文件夹名，例如 `task1`，确认 orchestrator 打印出 `Gripper action clients created`
 2. 在终端 3 按 `t`：日志显示 `State: IDLE -> TEACHING`，机械臂变软
 3. 用手把机械臂拖到起始姿态，需要时按 `o` / `c` 切换夹爪
 4. 拖完整条轨迹后按 `s`：日志输出 `Teach saved: N samples, duration X.Xs`
 5. 把工件 / 相机视野复位
 6. 按 `r`：机械臂开始重放，终端 1 控制器日志会显示 `Mode -> REPLAY`，轨迹结束时显示 `Replay finished; reverted to TEACH`
-7. 终端 3 自动保存 `replay/` 下的视频和关节数据
+7. replay 结束后终端 3 会提示选择：按 `1`/`s` 保存，按 `2`/`d` 删除整条轨迹，按 `3`/`r` 丢弃本次 replay 并准备重录
 
 ---
 
 ## 6. 输出文件
 
 ```
-~/robot_recordings/session_YYYYMMDD_HHMMSS/
-├── teach/
-│   ├── joint_trajectory.npz      # timestamps, joint_positions[N,7], gripper_widths[N,2]
-│   └── gripper_events.npz        # relative_times[K], actions[K]  ("open"/"close")
-└── replay/
-    ├── recording.avi             # 视频
-    ├── joint_trajectory.npz      # 实际执行的关节角
-    └── gripper_events.npz        # 重放时实际下达夹爪命令的时间戳
+~/robot_recordings/task1/
+├── traj_0/
+│   ├── teach/
+│   │   ├── joint_trajectory.npz  # timestamps, joint_positions[N,7], gripper_widths[N,2]
+│   │   └── gripper_events.npz    # relative_times[K], actions[K]  ("open"/"close")
+│   └── replay/
+│       ├── recording.avi         # 视频
+│       ├── joint_trajectory.npz  # timestamps, joint_positions[N,7]
+│       ├── joint_velocities.npz  # timestamps, joint_velocities[N,7]
+│       ├── end_effector_pose.npz # timestamps, end_effector_poses[N,7] = x,y,z,qx,qy,qz,qw
+│       └── gripper_events.npz    # 重放时实际下达夹爪命令的时间戳
+└── traj_1/
+    └── ...
 ```
 
 加载示例：
 ```python
 import numpy as np
-d = np.load("~/robot_recordings/session_.../teach/joint_trajectory.npz")
+d = np.load("~/robot_recordings/task1/traj_0/teach/joint_trajectory.npz")
 print(d["joint_positions"].shape)   # (N, 7)
 print(d["timestamps"][-1])          # 总时长
+
+ee = np.load("~/robot_recordings/task1/traj_0/replay/end_effector_pose.npz")
+print(ee["end_effector_poses"].shape)  # (N, 7), x,y,z,qx,qy,qz,qw
 ```
 
 ---
@@ -133,6 +160,7 @@ print(d["timestamps"][-1])          # 总时长
 | `/teach_replay/replay_started` | `std_msgs/Bool` | 控制器进入 REPLAY 时发一次 |
 | `/teach_replay/replay_finished` | `std_msgs/Bool` | 重放完成时发一次 |
 | `/joint_states` | `sensor_msgs/JointState` | 关节角来源（含 7 关节 + 2 finger） |
+| `/franka_robot_state_broadcaster/robot_state` | `franka_msgs/FrankaRobotState` | replay 关节速度和末端位姿来源 |
 | `/franka_gripper/move` | `franka_msgs/action/Move` | 张开夹爪到指定 width |
 | `/franka_gripper/grasp` | `franka_msgs/action/Grasp` | 抓取（带力控） |
 | `/franka_gripper/homing` | `franka_msgs/action/Homing` | 夹爪行程标定 |
@@ -179,6 +207,6 @@ move_to_start_max_velocity: 0.2   # rad/s，峰值每关节速度上限
 ## 10. 已知约束
 
 - **夹爪 namespace**：当前假设 `franka.config.yaml` 中 `namespace: ""`。若改了 namespace，需要修改 orchestrator 中 `/franka_gripper/...` 路径。
-- **录像时机**：视频写入由 image 回调驱动（实际帧率 ≈ 相机帧率），但 `VideoWriter` 的 fps 头由 `--fps` 决定；如果两者差距大，回放视频会快/慢于现实。把 `--fps` 设成相机实际帧率即可。
-- **数据时间基准**：teach/replay 双方的 `relative_times` 都以 `time.time()` 为基准（wall clock），不是 ROS time。
+- **录像时机**：视频写入由 image 回调驱动（实际帧率 ≈ `/camera/camera/color/image_raw/compressed` 的实际发布帧率），但 `VideoWriter` 的 fps 头由 `--fps` 决定；如果两者差距大，回放视频会快/慢于现实。若视频只有十几 Hz，先用 `ros2 topic hz /camera/camera/color/image_raw/compressed` 查相机源头帧率，再确认相机是用上面的 `realsense_d455.yaml` 启动的。
+- **数据时间基准**：teach/replay 双方的 `timestamps` / `relative_times` 都以 `time.time()` 为基准（wall clock），不是 ROS time。
 - **pre-roll 期间的夹爪状态**：示教记录里没有"起始夹爪状态"字段。如果示教第一个 gripper 事件不在 t=0，pre-roll 期间夹爪保持上一次操作的状态。如果需要严格匹配，按 `r` 前先手动把夹爪调到示教起始状态（或按 `h` homing）。

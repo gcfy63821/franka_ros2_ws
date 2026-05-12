@@ -4,7 +4,12 @@ camera_namespace: camera
 enable_color: true
 rgb_camera.color_profile: 640x480x30
 rgb_camera.color_format: RGB8
-rgb_camera.enable_auto_exposure: true
+rgb_camera.enable_auto_exposure: false
+rgb_camera.exposure: 10000
+rgb_camera.gain: 64
+color_qos: SENSOR_DATA
+color_info_qos: SENSOR_DATA
+camera.color.image_raw.enable_pub_plugins: [image_transport/raw, image_transport/compressed]
 
 enable_depth: false
 enable_infra: false

@@ -12,6 +12,7 @@
   <depend>controller_interface</depend>
   <depend>franka_msgs</depend>
   <depend>franka_semantic_components</depend>
+  <depend>geometry_msgs</depend>
   <depend>pinocchio</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
