@@ -429,6 +429,7 @@
 /**:
   ee_pose_replay_controller:
     ros__parameters:
+      arm_id: fr3
       gazebo: false
       mode_topic: "/ee_pose_replay/mode"
       trajectory_topic: "/ee_pose_replay/trajectory"
@@ -437,6 +438,12 @@
       # Before every FK replay, move from the current TCP pose to the first
       # FK pose with a min-jerk scalar profile. Keep these conservative.
       move_to_start: true
-      move_to_start_min_duration: 8.0
+      move_to_start_min_duration: 4.0
       move_to_start_max_translation_velocity: 0.05  # m/s, peak Cartesian pre-roll speed
       move_to_start_max_rotation_velocity: 0.5      # rad/s, peak pre-roll angular speed
+      # Cartesian impedance gains. Damping is auto-derived as
+      # 2 * joint_damping_ratio * sqrt(stiffness) (critically damped at ratio = 1).
+      translational_stiffness: 200.0    # N/m
+      rotational_stiffness: 20.0        # Nm/rad
+      nullspace_stiffness: 10.0         # Nm/rad on joint nullspace
+      joint_damping_ratio: 1.0

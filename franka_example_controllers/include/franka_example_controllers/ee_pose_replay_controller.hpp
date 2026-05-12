@@ -16,7 +16,7 @@
 
 #include <Eigen/Dense>
 #include <controller_interface/controller_interface.hpp>
-#include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
+#include <franka_semantic_components/franka_robot_model.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_publisher.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -29,11 +29,14 @@ using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface
 
 namespace franka_example_controllers {
 
-// Replays end-effector poses through Franka's Cartesian pose command interface.
-// The controller accepts trajectory_msgs/MultiDOFJointTrajectory on a topic.
-// Each point must contain one transform: translation [x,y,z] and quaternion
-// [x,y,z,w] in the robot base frame. Runtime mode is switched with:
-//   hold/replay on mode_topic.
+// Replays end-effector poses with a Cartesian impedance controller.
+//
+// The controller follows the same external protocol as the previous version
+// (mode topic + MultiDOFJointTrajectory + start/finish booleans), but the
+// inner loop is torque-based: it reads joint states + Jacobian from the
+// franka_robot_model interface, computes the Cartesian pose error against a
+// smooth reference (HOLD / PRE_ROLL min-jerk / TRACKING cubic Hermite), and
+// emits joint efforts via tau = J^T (Kp*err + Kd*err_dot) + nullspace + coriolis.
 class EePoseReplayController : public controller_interface::ControllerInterface {
  public:
   CallbackReturn on_init() override;
@@ -52,6 +55,9 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
  private:
   enum class Phase : int { HOLD = 0, PRE_ROLL = 1, TRACKING = 2 };
 
+  static constexpr int kNumJoints = 7;
+  using Vector7d = Eigen::Matrix<double, 7, 1>;
+
   struct Trajectory {
     std::vector<double> times;
     std::vector<Eigen::Vector3d> positions;
@@ -62,15 +68,22 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   void modeCallback(const std_msgs::msg::String::SharedPtr msg);
   void trajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectory::SharedPtr msg);
   void consumePendingTrajectoryIfReady(Phase phase);
+  void updateJointStates();
   void updateCurrentPose();
-  bool commandPose(const Eigen::Quaterniond& orientation, const Eigen::Vector3d& position);
   void publishStarted();
   void publishFinished();
 
-  std::unique_ptr<franka_semantic_components::FrankaCartesianPoseInterface> franka_cartesian_pose_;
-  const bool k_elbow_activated_{false};
+  // Compute desired Cartesian pose for the current update tick (sets
+  // desired_position_/desired_orientation_, returns false if no command should
+  // be emitted this tick — e.g., when the sanity guard aborts pre-roll).
+  bool computeDesiredPose(const rclcpp::Duration& period);
+
+  // Compute Cartesian impedance joint torques given current state and the
+  // desired pose stored in desired_position_/desired_orientation_.
+  Vector7d computeImpedanceTorque();
 
   // Parameters
+  std::string arm_id_;
   std::string mode_topic_;
   std::string trajectory_topic_;
   std::string start_topic_;
@@ -81,13 +94,42 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   double move_to_start_max_translation_velocity_{0.05};
   double move_to_start_max_rotation_velocity_{0.5};
 
-  // Pose state
+  double translational_stiffness_{200.0};
+  double rotational_stiffness_{20.0};
+  double nullspace_stiffness_{10.0};
+  double joint_damping_ratio_{1.0};
+
+  // Stiffness/damping matrices derived from the scalar parameters
+  Eigen::Matrix<double, 6, 6> cartesian_stiffness_;
+  Eigen::Matrix<double, 6, 6> cartesian_damping_;
+  Vector7d nullspace_q_target_;
+
+  // Robot model semantic component for FK + Jacobian + Coriolis
+  std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
+  const std::string k_robot_model_interface_name_{"robot_model"};
+  const std::string k_robot_state_interface_name_{"robot_state"};
+
+  // Joint state (read each tick from state_interfaces_)
+  Vector7d q_;
+  Vector7d dq_;
+  Vector7d dq_filtered_;
+
+  // Current EE pose (read each tick via robot_model FK)
   Eigen::Quaterniond current_orientation_{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d current_position_{Eigen::Vector3d::Zero()};
+
+  // Desired pose (set by phase machinery each tick)
+  Eigen::Quaterniond desired_orientation_{Eigen::Quaterniond::Identity()};
+  Eigen::Vector3d desired_position_{Eigen::Vector3d::Zero()};
+
+  // Hold target (captured at HOLD entry)
   Eigen::Quaterniond hold_orientation_{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d hold_position_{Eigen::Vector3d::Zero()};
   bool hold_initialized_{false};
   std::atomic<bool> hold_reset_requested_{false};
+
+  // Last commanded (smoothed) pose, used as PRE_ROLL start to guarantee
+  // continuity with the HOLD reference stream.
   Eigen::Quaterniond last_command_orientation_{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d last_command_position_{Eigen::Vector3d::Zero()};
   bool last_command_initialized_{false};
