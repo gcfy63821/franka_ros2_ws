@@ -437,6 +437,6 @@
       # Before every FK replay, move from the current TCP pose to the first
       # FK pose with a min-jerk scalar profile. Keep these conservative.
       move_to_start: true
-      move_to_start_min_duration: 4.0
+      move_to_start_min_duration: 8.0
       move_to_start_max_translation_velocity: 0.05  # m/s, peak Cartesian pre-roll speed
       move_to_start_max_rotation_velocity: 0.5      # rad/s, peak pre-roll angular speed

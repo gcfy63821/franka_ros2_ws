@@ -108,6 +108,7 @@ class EePoseReplayController : public controller_interface::ControllerInterface 
   Eigen::Vector3d pre_roll_position_start_{Eigen::Vector3d::Zero()};
   double pre_roll_duration_{0.0};
   double pre_roll_elapsed_{0.0};
+  int last_pre_roll_log_slot_{-1};
 
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_sub_;
   rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr trajectory_sub_;

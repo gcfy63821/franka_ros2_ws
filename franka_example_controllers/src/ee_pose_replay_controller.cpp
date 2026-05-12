@@ -173,6 +173,7 @@ CallbackReturn EePoseReplayController::on_activate(
   segment_index_ = 0;
   pre_roll_duration_ = 0.0;
   pre_roll_elapsed_ = 0.0;
+  last_pre_roll_log_slot_ = -1;
   start_pub_->on_activate();
   finish_pub_->on_activate();
   RCLCPP_INFO(get_node()->get_logger(), "EePoseReplayController activated in HOLD mode");
@@ -398,9 +399,17 @@ controller_interface::return_type EePoseReplayController::update(
         return controller_interface::return_type::OK;
       }
 
-      pre_roll_position_start_ = current_position_;
-      pre_roll_orientation_start_ = current_orientation_;
+      // Use last_command_position_/orientation_ to guarantee perfect
+      // continuity with the HOLD command stream (no 1-tick position step).
+      if (!last_command_initialized_) {
+        last_command_position_ = current_position_;
+        last_command_orientation_ = current_orientation_;
+        last_command_initialized_ = true;
+      }
+      pre_roll_position_start_ = last_command_position_;
+      pre_roll_orientation_start_ = last_command_orientation_;
       pre_roll_elapsed_ = 0.0;
+      last_pre_roll_log_slot_ = -1;
 
       const Eigen::Vector3d target_position = traj.positions.front();
       const Eigen::Quaterniond target_orientation = traj.orientations.front();
@@ -446,13 +455,22 @@ controller_interface::return_type EePoseReplayController::update(
         pre_roll_position_start_ + s * (traj.positions.front() - pre_roll_position_start_);
     orientation_command = pre_roll_orientation_start_.slerp(s, traj.orientations.front());
 
-    // First few ticks of pre-roll: print the commanded pose so we can see
-    // whether libfranka is being fed a jump.
-    if (pre_roll_elapsed_ <= 3.5 * period.seconds()) {
-      RCLCPP_INFO(get_node()->get_logger(),
-                  "PRE_ROLL tick t=%.4f s=%.3e cmd_pos=(%.4f,%.4f,%.4f)",
-                  pre_roll_elapsed_, s, position_command.x(), position_command.y(),
-                  position_command.z());
+    // Print first 3 ticks, then sample every ~50 ms so we can see the
+    // command stream evolving up to (and around) the reflex point.
+    {
+      const bool early_tick = pre_roll_elapsed_ <= 3.5 * period.seconds();
+      const int slot = static_cast<int>(pre_roll_elapsed_ / 0.05);
+      const bool slot_changed = slot != last_pre_roll_log_slot_;
+      if (early_tick || slot_changed) {
+        last_pre_roll_log_slot_ = slot;
+        RCLCPP_INFO(
+            get_node()->get_logger(),
+            "PRE_ROLL tick t=%.4f s=%.4e cmd_pos=(%.4f,%.4f,%.4f) "
+            "cmd_quat=(%.4f,%.4f,%.4f,%.4f)",
+            pre_roll_elapsed_, s, position_command.x(), position_command.y(),
+            position_command.z(), orientation_command.x(), orientation_command.y(),
+            orientation_command.z(), orientation_command.w());
+      }
     }
 
     if (pre_roll_elapsed_ >= pre_roll_duration_) {
