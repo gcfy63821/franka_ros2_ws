@@ -443,7 +443,7 @@
       move_to_start_max_rotation_velocity: 0.5      # rad/s, peak pre-roll angular speed
       # Cartesian impedance gains. Damping is auto-derived as
       # 2 * joint_damping_ratio * sqrt(stiffness) (critically damped at ratio = 1).
-      translational_stiffness: 200.0    # N/m
-      rotational_stiffness: 20.0        # Nm/rad
-      nullspace_stiffness: 10.0         # Nm/rad on joint nullspace
+      translational_stiffness: 800.0    # N/m
+      rotational_stiffness: 40.0        # Nm/rad
+      nullspace_stiffness: 20.0         # Nm/rad on joint nullspace
       joint_damping_ratio: 1.0

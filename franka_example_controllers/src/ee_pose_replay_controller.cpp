@@ -583,6 +583,18 @@ EePoseReplayController::Vector7d EePoseReplayController::computeImpedanceTorque(
   std::array<double, 7> coriolis_array = franka_robot_model_->getCoriolisForceVector();
   Vector7d coriolis(coriolis_array.data());
 
+  // Diagnostic: print Jacobian magnitude and pos-error norm at low rate.
+  static int diag_counter = 0;
+  if (++diag_counter >= 100) {
+    diag_counter = 0;
+    Eigen::Vector3d pos_err = current_position_ - desired_position_;
+    RCLCPP_INFO(get_node()->get_logger(),
+                "DIAG: |pos_err|=%.4f m J_v_norm=%.3f J_w_norm=%.3f",
+                pos_err.norm(),
+                jacobian.topRows<3>().norm(),
+                jacobian.bottomRows<3>().norm());
+  }
+
   // Cartesian pose error: position then orientation (axis-angle, base frame).
   Eigen::Matrix<double, 6, 1> error;
   error.head<3>() = current_position_ - desired_position_;
@@ -610,7 +622,21 @@ EePoseReplayController::Vector7d EePoseReplayController::computeImpedanceTorque(
   Vector7d tau_null = N * (nullspace_stiffness_ * (nullspace_q_target_ - q_) -
                            nullspace_damping * dq_filtered_);
 
-  return tau_task + tau_null + coriolis;
+  Vector7d tau = tau_task + tau_null + coriolis;
+
+  // Diagnostic: print torque breakdown at the same low rate.
+  if (diag_counter == 0) {
+    RCLCPP_INFO(get_node()->get_logger(),
+                "DIAG tau_task=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
+                "tau_null=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
+                "tau_tot=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f]",
+                tau_task(0), tau_task(1), tau_task(2), tau_task(3),
+                tau_task(4), tau_task(5), tau_task(6),
+                tau_null(0), tau_null(1), tau_null(2), tau_null(3),
+                tau_null(4), tau_null(5), tau_null(6),
+                tau(0), tau(1), tau(2), tau(3), tau(4), tau(5), tau(6));
+  }
+  return tau;
 }
 
 controller_interface::return_type EePoseReplayController::update(
